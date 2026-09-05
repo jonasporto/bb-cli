@@ -1,0 +1,4097 @@
+#!/bin/bash
+#
+# bb-cli - Bitbucket CLI
+#
+# Usage:
+#   bb-cli <command> [options]
+#
+# Commands:
+#   login   Configure credentials
+#   logout  Remove stored credentials
+#   status  Show authentication status
+#   pr      List/search pull requests
+#   pipeline List/show pipelines and steps
+#   repo    Repository info
+#   branch  List branches
+#   help    Show help for a command
+#
+
+set -e
+
+# Resolve symlinks before taking the directory. install.sh links bin/bb-cli
+# onto PATH, so without this SCRIPT_DIR would be ~/.local/bin and `bb-cli docs`,
+# `bb-cli man` and `bb-cli skill` would all look for files that are not there.
+_bb_source="${BASH_SOURCE[0]}"
+while [[ -L "$_bb_source" ]]; do
+    _bb_dir="$(cd -P "$(dirname "$_bb_source")" && pwd)"
+    _bb_source="$(readlink "$_bb_source")"
+    [[ "$_bb_source" != /* ]] && _bb_source="${_bb_dir}/${_bb_source}"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$_bb_source")" && pwd)"
+# The real file, symlinks resolved. `bb-cli upgrade` writes through this when
+# the install is a single script: replacing the symlink instead would leave the
+# file it points at stale.
+BB_CLI_SELF="${SCRIPT_DIR}/$(basename "$_bb_source")"
+unset _bb_source _bb_dir
+BB_CLI_VERSION="0.2.0"
+CONFIG_DIR="${HOME}/.config/bb-cli"
+CREDENTIALS_FILE="${CONFIG_DIR}/credentials"
+WORKSPACE=""
+REPO=""
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+# Every request goes through here. The credential is fed to curl on stdin as a
+# -K config rather than as `-u` on the command line: argv is world-readable on
+# Linux via /proc/<pid>/cmdline, lands in audit logs, and shows up in `bash -x`.
+bb_curl() {
+    local esc_user="${BITBUCKET_USERNAME//\\/\\\\}"
+    esc_user="${esc_user//\"/\\\"}"
+    local esc_token="${BITBUCKET_TOKEN//\\/\\\\}"
+    esc_token="${esc_token//\"/\\\"}"
+    printf 'user = "%s:%s"\n' "$esc_user" "$esc_token" | curl -K - "$@"
+}
+
+# Load credentials from config file or environment
+load_credentials() {
+    # Environment variables take precedence (support both old and new names)
+    if [[ -n "$BITBUCKET_USERNAME" ]] && [[ -n "${BITBUCKET_API_TOKEN:-$BITBUCKET_APP_PASSWORD}" ]]; then
+        BITBUCKET_TOKEN="${BITBUCKET_API_TOKEN:-$BITBUCKET_APP_PASSWORD}"
+        return 0
+    fi
+
+    # Try to load from config file
+    if [[ -f "$CREDENTIALS_FILE" ]]; then
+        source "$CREDENTIALS_FILE"
+        # Support both old (APP_PASSWORD) and new (API_TOKEN) format
+        BITBUCKET_TOKEN="${BITBUCKET_API_TOKEN:-$BITBUCKET_APP_PASSWORD}"
+        return 0
+    fi
+
+    return 1
+}
+
+# Parse workspace/repo from a Bitbucket repo reference.
+set_repo_info_from_ref() {
+    local ref="$1"
+    local repo_part
+
+    if [[ "$ref" =~ ^([^/:]+)/([^/]+)$ ]]; then
+        WORKSPACE="${BASH_REMATCH[1]}"
+        repo_part="${BASH_REMATCH[2]}"
+        REPO="${repo_part%.git}"
+        return 0
+    fi
+
+    if [[ "$ref" =~ bitbucket\.org[:/]([^/]+)/([^/]+) ]]; then
+        WORKSPACE="${BASH_REMATCH[1]}"
+        repo_part="${BASH_REMATCH[2]}"
+        REPO="${repo_part%.git}"
+        return 0
+    fi
+
+    return 1
+}
+
+# Parse workspace/repo from git remote
+get_repo_info() {
+    local remote_url
+    remote_url=$(git remote get-url origin 2>/dev/null || echo "")
+
+    if [[ -z "$remote_url" ]]; then
+        echo -e "${RED}Error:${NC} Not in a git repository or no origin remote" >&2
+        exit 1
+    fi
+
+    if ! set_repo_info_from_ref "$remote_url"; then
+        echo -e "${RED}Error:${NC} Could not parse Bitbucket URL from: $remote_url" >&2
+        exit 1
+    fi
+}
+
+# Check credentials
+check_credentials() {
+    load_credentials
+
+    if [[ -z "$BITBUCKET_USERNAME" ]] || [[ -z "$BITBUCKET_TOKEN" ]]; then
+        echo ""
+        echo -e "${RED}Bitbucket credentials not configured.${NC}"
+        echo ""
+        echo -e "Run ${CYAN}bb-cli login${NC} to configure."
+        echo ""
+        exit 1
+    fi
+}
+
+# ============================================================================
+# COMMAND: login - Configure credentials
+# ============================================================================
+cmd_login_instructions() {
+    echo ""
+    echo -e "${BLUE}Bitbucket Login${NC}"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    echo "You need an Atlassian API token scoped to Bitbucket."
+    echo ""
+    echo -e "1. Go to: ${CYAN}https://id.atlassian.com/manage-profile/security/api-tokens${NC}"
+    echo "2. Click 'Create API token with scopes'"
+    echo -e "3. Pick the ${YELLOW}Bitbucket${NC} app. A token reaches exactly one Atlassian"
+    echo "   product, chosen here and never changeable."
+    echo "4. Check these five scopes:"
+    echo ""
+    echo -e "     ${CYAN}read:repository:bitbucket     write:pipeline:bitbucket${NC}"
+    echo -e "     ${CYAN}read:pullrequest:bitbucket    write:pullrequest:bitbucket${NC}"
+    echo -e "     ${CYAN}read:pipeline:bitbucket${NC}"
+    echo ""
+    echo -e "   ${YELLOW}write does not imply read.${NC} Check both halves of each pair, or"
+    echo "   editing a pull request works while reading one does not."
+    echo "5. Copy the token. It is shown once, and the scopes are fixed at"
+    echo "   creation, so a missing one means creating a new token."
+    echo ""
+    echo -e "${YELLOW}Note:${NC} the username is your Atlassian account EMAIL, not a"
+    echo "      Bitbucket username."
+    echo ""
+    echo -e "Why these five, and which look necessary but are not: ${CYAN}bb-cli docs scopes${NC}"
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+}
+
+cmd_login_help() {
+    cat << 'EOF'
+Usage: bb-cli login [--with-token --email <email>]
+
+Store an Atlassian API token for Bitbucket.
+
+With no flags it is interactive: it prints what to click, then prompts for
+your account email and the token.
+
+  --with-token      read the token from stdin and prompt for nothing. This is
+                    the form a script, a CI job or an agent can complete.
+  --email <email>   your Atlassian account email. With --with-token, defaults
+                    to $BITBUCKET_USERNAME, then to `git config user.email`.
+
+Examples:
+  bb-cli login
+  printf %s "$TOKEN" | bb-cli login --with-token --email you@example.com
+  bb-cli login --with-token --email you@example.com < token.txt
+
+The token is verified against the API before anything is written. It lands in
+~/.config/bb-cli/credentials, mode 600 in a 700 directory.
+
+The environment wins over that file, so a token can also be supplied without
+logging in at all:
+
+  export BITBUCKET_USERNAME=you@example.com BITBUCKET_API_TOKEN=...
+EOF
+}
+
+cmd_login() {
+    local with_token=false email="" token=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --with-token) with_token=true; shift ;;
+            --email)      email="$2"; shift 2 ;;
+            --email=*)    email="${1#*=}"; shift ;;
+            -h|--help)    cmd_login_help; return 0 ;;
+            *)            echo -e "${RED}Error:${NC} unexpected argument: $1" >&2; return 1 ;;
+        esac
+    done
+
+    if [[ "$with_token" == true ]]; then
+        # gh's `auth login --with-token`: the token on stdin, nothing prompted.
+        # This is the form an agent or a CI job can actually complete.
+        IFS= read -r token || true
+        token="${token%$'\r'}"          # a token pasted from a browser on Windows
+        if [[ -z "$token" ]]; then
+            echo -e "${RED}Error:${NC} --with-token reads the token from stdin, and stdin was empty" >&2
+            echo "" >&2
+            echo "    printf %s \"\$TOKEN\" | bb-cli login --with-token --email you@example.com" >&2
+            return 1
+        fi
+        [[ -n "$email" ]] || email="${BITBUCKET_USERNAME:-}"
+        [[ -n "$email" ]] || email=$(git config user.email 2>/dev/null || echo "")
+        if [[ -z "$email" ]]; then
+            echo -e "${RED}Error:${NC} no account email. Pass --email, or set BITBUCKET_USERNAME." >&2
+            echo "  It is your Atlassian account email, not a Bitbucket username." >&2
+            return 1
+        fi
+    else
+        cmd_login_instructions
+
+        # An agent, a pipe or a `< /dev/null` reaches `read` and gets EOF, which
+        # used to look like the user submitting an empty answer. Say what to do
+        # instead of failing on a prompt nobody could see.
+        if [[ ! -t 0 ]]; then
+            echo -e "${RED}Error:${NC} bb-cli login is interactive, and stdin is not a terminal." >&2
+            echo "" >&2
+            echo "  Non-interactively, pass the token on stdin:" >&2
+            echo "" >&2
+            echo -e "    ${CYAN}printf %s \"\$TOKEN\" | bb-cli login --with-token --email you@example.com${NC}" >&2
+            echo "" >&2
+            echo "  Or skip the file entirely. The environment wins over it:" >&2
+            echo "" >&2
+            echo -e "    ${CYAN}export BITBUCKET_USERNAME=you@example.com BITBUCKET_API_TOKEN=...${NC}" >&2
+            return 1
+        fi
+
+        local default_email=""
+        default_email=$(git config user.email 2>/dev/null || echo "")
+
+        if [[ -n "$default_email" ]]; then
+            read -p "Atlassian account email [${default_email}]: " email
+            email="${email:-$default_email}"
+        else
+            read -p "Atlassian account email: " email
+        fi
+
+        if [[ -z "$email" ]]; then
+            echo -e "${RED}Error:${NC} Email is required" >&2
+            return 1
+        fi
+
+        read -s -p "API token: " token
+        echo ""
+        if [[ -z "$token" ]]; then
+            echo -e "${RED}Error:${NC} Token is required" >&2
+            return 1
+        fi
+    fi
+
+    # Test credentials - try to detect workspace/repo from git remote
+    echo ""
+    echo -n "Testing credentials... "
+
+    local test_url="https://api.bitbucket.org/2.0/user"
+    local test_workspace=""
+    local test_repo=""
+
+    # Try to get workspace/repo from current git remote for better testing
+    local remote_url
+    remote_url=$(git remote get-url origin 2>/dev/null || echo "")
+    if [[ "$remote_url" =~ bitbucket\.org[:/]([^/]+)/([^/.]+) ]]; then
+        test_workspace="${BASH_REMATCH[1]}"
+        test_repo="${BASH_REMATCH[2]}"
+        test_url="https://api.bitbucket.org/2.0/repositories/${test_workspace}/${test_repo}"
+    fi
+
+    local response
+    response=$(curl -s -u "${email}:${token}" \
+        "${test_url}" \
+        -H "Accept: application/json" \
+        -w "\n%{http_code}")
+
+    local http_code
+    http_code=$(echo "$response" | tail -1)
+    local body
+    body=$(echo "$response" | sed '$d')
+
+    if [[ "$http_code" == "200" ]]; then
+        echo -e "${GREEN}OK${NC}"
+        echo ""
+        echo -e "Authenticated as: ${GREEN}${email}${NC}"
+        if [[ -n "$test_workspace" ]]; then
+            echo -e "Tested against: ${CYAN}${test_workspace}/${test_repo}${NC}"
+        fi
+
+        # Save credentials
+        umask 077
+        mkdir -p "$CONFIG_DIR"
+        chmod 700 "$CONFIG_DIR"
+        # printf %q, not a heredoc: this file is sourced on every run, so a
+        # token containing a quote or $( would become shell code that
+        # executes for as long as it sits there. Paste accidents happen.
+        {
+            printf '# bb-cli credentials\n'
+            printf '# Keep this file out of any git repository.\n'
+            printf 'BITBUCKET_USERNAME=%q\n' "$email"
+            printf 'BITBUCKET_API_TOKEN=%q\n' "$token"
+        } > "$CREDENTIALS_FILE"
+        chmod 600 "$CREDENTIALS_FILE"
+
+        echo ""
+        echo -e "Credentials saved to: ${CYAN}${CREDENTIALS_FILE}${NC}"
+        echo ""
+        echo -e "${GREEN}Login successful!${NC}"
+        echo ""
+    else
+        echo -e "${RED}FAILED${NC}"
+        echo ""
+        echo -e "${RED}Error:${NC} Authentication failed (HTTP ${http_code})"
+        echo ""
+        if [[ "$http_code" == "401" || "$http_code" == "403" ]]; then
+            echo "Tips:"
+            echo "  - The username is your Atlassian account EMAIL, not a Bitbucket username"
+            echo "  - Scopes are fixed at creation. A token missing one cannot be"
+            echo "    amended; create a new one with all five:"
+            echo "    https://id.atlassian.com/manage-profile/security/api-tokens"
+            echo -e "  - ${CYAN}bb-cli docs scopes${NC} lists them, and how to prove what a token holds"
+        fi
+        return 1
+    fi
+}
+
+# ============================================================================
+# COMMAND: logout - Remove credentials
+# ============================================================================
+cmd_logout() {
+    if [[ -f "$CREDENTIALS_FILE" ]]; then
+        rm -f "$CREDENTIALS_FILE"
+        echo ""
+        echo -e "${GREEN}Logged out.${NC} Credentials removed."
+        echo ""
+    else
+        echo ""
+        echo -e "${YELLOW}No stored credentials found.${NC}"
+        echo ""
+    fi
+
+    if [[ -n "$BITBUCKET_USERNAME" ]] || [[ -n "$BITBUCKET_API_TOKEN" ]] || [[ -n "$BITBUCKET_APP_PASSWORD" ]]; then
+        echo -e "${YELLOW}Note:${NC} Environment variables are still set:"
+        [[ -n "$BITBUCKET_USERNAME" ]] && echo "  BITBUCKET_USERNAME"
+        [[ -n "$BITBUCKET_API_TOKEN" ]] && echo "  BITBUCKET_API_TOKEN"
+        [[ -n "$BITBUCKET_APP_PASSWORD" ]] && echo "  BITBUCKET_APP_PASSWORD (deprecated)"
+        echo ""
+        echo "Unset them with:"
+        echo "  unset BITBUCKET_USERNAME BITBUCKET_API_TOKEN BITBUCKET_APP_PASSWORD"
+        echo ""
+    fi
+}
+
+# ============================================================================
+# COMMAND: status - Show authentication status
+# ============================================================================
+cmd_status() {
+    echo ""
+    echo -e "${BLUE}Authentication Status${NC}"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+
+    # docs/setup.md tells the reader that `status` reports a missing dependency.
+    # It has to actually do it, and before the credential lines: without jq
+    # there is nothing this command can usefully say about a token.
+    local dep_missing
+    dep_missing="$(bb_missing_deps curl jq git)"
+    if [[ -n "$dep_missing" ]]; then
+        echo -e "  Missing:  ${RED}${dep_missing}${NC}"
+        echo ""
+        echo -e "    ${CYAN}$(bb_install_hint $dep_missing)${NC}"
+        echo ""
+    fi
+
+    # Without curl or jq nothing below can run, and saying "not authenticated"
+    # would blame the token for a missing package.
+    if [[ -n "$(bb_missing_deps curl jq)" ]]; then
+        echo "  Install those first, then run this again to check the token."
+        echo ""
+        return 1
+    fi
+
+    local cred_source="none"
+
+    # Check environment variables
+    if [[ -n "$BITBUCKET_USERNAME" ]] && [[ -n "${BITBUCKET_API_TOKEN:-$BITBUCKET_APP_PASSWORD}" ]]; then
+        cred_source="environment"
+        BITBUCKET_TOKEN="${BITBUCKET_API_TOKEN:-$BITBUCKET_APP_PASSWORD}"
+        echo -e "  Source:   ${CYAN}Environment variables${NC}"
+        echo -e "  Username: ${GREEN}${BITBUCKET_USERNAME}${NC}"
+    elif [[ -f "$CREDENTIALS_FILE" ]]; then
+        source "$CREDENTIALS_FILE"
+        BITBUCKET_TOKEN="${BITBUCKET_API_TOKEN:-$BITBUCKET_APP_PASSWORD}"
+        cred_source="config"
+        echo -e "  Source:   ${CYAN}${CREDENTIALS_FILE}${NC}"
+        echo -e "  Username: ${GREEN}${BITBUCKET_USERNAME}${NC}"
+    else
+        echo -e "  Status: ${RED}Not authenticated${NC}"
+        echo ""
+        echo -e "  Run ${CYAN}bb-cli login${NC} to configure."
+        echo ""
+        # Non-zero, like `gh auth status`, so `bb-cli status || bb-cli login`
+        # works and a CI job can gate on it.
+        return 1
+    fi
+
+    # Verify. The reliable signal is the x-oauth-scopes header, not the status
+    # code: every authenticated response carries it, including error ones. The
+    # account-wide endpoints (GET /user, /workspaces, /user/permissions/...)
+    # answer 410 Gone for API tokens, and /user answers 403 for a token without
+    # read:account - which this tool tells you to leave off on purpose. Judging
+    # by status code alone reported "Invalid credentials" for a perfectly good
+    # token, which is the worst possible first impression on a new machine.
+    echo -n "  Status:   "
+
+    local probe_url="https://api.bitbucket.org/2.0/user"
+    local probe_is_repo=false
+    local remote_url
+    remote_url=$(git remote get-url origin 2>/dev/null || echo "")
+    if [[ "$remote_url" =~ bitbucket\.org[:/]([^/]+)/([^/.]+) ]]; then
+        probe_url="https://api.bitbucket.org/2.0/repositories/${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+        probe_is_repo=true
+    fi
+
+    local rc=0
+    api_request GET "$probe_url" || rc=$?
+
+    if [[ $rc -ne 0 ]]; then
+        api_cleanup
+        echo -e "${RED}Could not reach Bitbucket${NC}"
+        echo ""
+        return 1
+    fi
+
+    local granted_scopes=""
+    if [[ -f "$API_HEADERS_FILE" ]]; then
+        granted_scopes=$(grep -i '^x-oauth-scopes:' "$API_HEADERS_FILE" 2>/dev/null \
+            | tail -1 | cut -d: -f2- | tr -d '\r' | sed 's/^ *//')
+    fi
+
+    local status_code="$API_STATUS"
+    local body=""
+    [[ -f "$API_BODY_FILE" ]] && body="$(cat "$API_BODY_FILE")"
+    api_cleanup
+
+    if [[ "$status_code" == "401" ]] || [[ -z "$granted_scopes" && "$status_code" != "200" ]]; then
+        echo -e "${RED}Invalid credentials${NC} (HTTP ${status_code})"
+        echo ""
+        echo -e "  Run ${CYAN}bb-cli login${NC} to reconfigure, or ${CYAN}bb-cli docs setup${NC}."
+        echo ""
+        return 1
+    fi
+
+    if [[ "$status_code" == "200" ]]; then
+        local display_name
+        if [[ "$probe_is_repo" == true ]]; then
+            display_name=$(printf '%s' "$body" | jq -r '.full_name // "repository access verified"' 2>/dev/null)
+            echo -e "${GREEN}Authenticated${NC} (verified against ${display_name})"
+        else
+            display_name=$(printf '%s' "$body" | jq -r '.display_name // .username // "unknown"' 2>/dev/null)
+            echo -e "${GREEN}Authenticated${NC} as ${display_name}"
+        fi
+    else
+        # Scopes came back, so the credential is good; that endpoint is simply
+        # not something this token is allowed to call.
+        echo -e "${GREEN}Authenticated${NC} (token accepted; HTTP ${status_code} on the probe endpoint)"
+    fi
+
+    if [[ -n "$granted_scopes" ]]; then
+        echo -e "  Scopes:   ${CYAN}${granted_scopes}${NC}"
+
+        local missing=""
+        local scope
+        for scope in read:repository read:pullrequest write:pullrequest read:pipeline write:pipeline; do
+            [[ "$granted_scopes" == *"${scope}:bitbucket"* ]] || missing="${missing}${missing:+, }${scope}:bitbucket"
+        done
+        if [[ -n "$missing" ]]; then
+            echo -e "  ${YELLOW}Missing:${NC}  ${missing}"
+            echo -e "            Some commands will 403. See ${CYAN}bb-cli docs scopes${NC}."
+        fi
+    fi
+
+    if [[ "$probe_is_repo" == false ]]; then
+        echo -e "  Repo:     not in a Bitbucket checkout; pass ${CYAN}--repo workspace/slug${NC}"
+    fi
+
+    # The setup doc promises this check lives here.
+    local missing_deps=""
+    local dep
+    for dep in curl jq git; do
+        command -v "$dep" > /dev/null 2>&1 || missing_deps="${missing_deps}${missing_deps:+ }${dep}"
+    done
+    if [[ -n "$missing_deps" ]]; then
+        echo -e "  ${RED}Missing:${NC}  ${missing_deps} - bb-cli needs curl, jq and git"
+    fi
+
+    echo ""
+
+    # Exactly one call site. `status` is the "how are things" command: it is
+    # always run by a human, and never piped into jq.
+    bb_maybe_notify_update
+}
+
+# API request helper
+bb_api() {
+    local endpoint="$1"
+    local params="${2:-}"
+
+    bb_curl -s \
+        "https://api.bitbucket.org/2.0/${endpoint}${params:+?$params}" \
+        -H "Accept: application/json"
+}
+
+bb_api_raw() {
+    local endpoint="$1"
+
+    bb_curl -sL "https://api.bitbucket.org/2.0/${endpoint}"
+}
+
+bb_api_post() {
+    local endpoint="$1"
+    local body="$2"
+
+    bb_curl -s \
+        -X POST "https://api.bitbucket.org/2.0/${endpoint}" \
+        -H "Accept: application/json" \
+        -H "Content-Type: application/json" \
+        -d "$body"
+}
+
+bb_response_has_error() {
+    local response="$1"
+
+    echo "$response" | jq -e '.error' > /dev/null 2>&1
+}
+
+bb_response_error_message() {
+    local response="$1"
+
+    echo "$response" | jq -r '.error.message // .error.detail // .error // "Unknown Bitbucket API error"' 2>/dev/null
+}
+
+encode_bb_uuid() {
+    local value="$1"
+
+    value="${value//%7B/}"
+    value="${value//%7D/}"
+    value="${value//%7b/}"
+    value="${value//%7d/}"
+    value="${value#\{}"
+    value="${value%\}}"
+
+    if [[ "$value" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+        echo "%7B${value}%7D"
+    else
+        echo "$value"
+    fi
+}
+
+# Percent-encode the braces of any {uuid} path segment.
+#
+# Bitbucket returns pipeline and step uuids wrapped in braces, and rejects them
+# in a path unless the braces are percent-encoded: a raw {be3059e8-...} answers
+# 400, which reads like a malformed request or a missing scope and is neither.
+# The porcelain commands run everything through encode_bb_uuid; `bb-cli api`
+# used to pass the path through untouched, so copying a uuid out of one command
+# and into the other failed for a reason nothing explained.
+bb_encode_path_braces() {
+    local path="$1"
+    [[ "$path" == *'{'* ]] || { printf '%s' "$path"; return 0; }
+
+    local out="" seg first=true
+    local old_ifs="$IFS"
+    local -a segments
+    IFS='/'
+    read -ra segments <<< "$path"
+    IFS="$old_ifs"
+
+    for seg in "${segments[@]}"; do
+        if [[ "$seg" == \{*\} ]]; then
+            seg="${seg#\{}"
+            seg="${seg%\}}"
+            seg="%7B${seg}%7D"
+        fi
+        if [[ "$first" == true ]]; then
+            out="$seg"
+            first=false
+        else
+            out="${out}/${seg}"
+        fi
+    done
+
+    printf '%s' "$out"
+}
+
+pipeline_status_label() {
+    jq -r '
+        def clean:
+          tostring
+          | gsub("^PIPELINE_STATE_"; "")
+          | gsub("^PIPELINE_STEP_STATE_"; "")
+          | gsub("_"; " ")
+          | ascii_upcase;
+        (.state.result.name // .state.name // .state.stage.name // "UNKNOWN") | clean
+    '
+}
+
+print_pipeline_rows() {
+    local workspace="$1"
+    local repo="$2"
+
+    jq -r --arg workspace "$workspace" --arg repo "$repo" '
+        def status:
+          (.state.result.name // .state.name // .state.stage.name // "UNKNOWN")
+          | tostring
+          | gsub("^PIPELINE_STATE_"; "")
+          | gsub("_"; " ")
+          | ascii_upcase;
+        def duration:
+          (if (.duration_in_seconds // 0) > 0 then .duration_in_seconds else .build_seconds_used end) as $s
+          | if $s == null then "N/A"
+            elif $s >= 3600 then "\(($s / 3600 | floor))h \((($s % 3600) / 60 | floor))m \($s % 60)s"
+            elif $s >= 60 then "\(($s / 60 | floor))m \($s % 60)s"
+            else "\($s)s"
+            end;
+        def short_commit: (.target.commit.hash // "N/A") | if length > 12 then .[0:12] else . end;
+        def pipeline_type: (.target.selector.type // .target.type // "N/A");
+        def trigger_type: (.trigger.type // .trigger.name // "N/A");
+        .values[] |
+        "  \u001b[1;33m#\(.build_number)\u001b[0m \(status) • \(duration)",
+        "     branch: \u001b[0;36m\(.target.ref_name // "N/A")\u001b[0m • commit: \(short_commit)",
+        "     ran by: \(.creator.display_name // "unknown") • pipeline: \(pipeline_type) • trigger: \(trigger_type)",
+        "     uuid: \(.uuid)",
+        "     url:  https://bitbucket.org/\($workspace)/\($repo)/pipelines/results/\(.build_number)",
+        ""
+    '
+}
+
+print_step_rows() {
+    jq -r '
+        def status:
+          (.state.result.name // .state.name // .state.stage.name // "UNKNOWN")
+          | tostring
+          | gsub("^PIPELINE_STATE_"; "")
+          | gsub("^PIPELINE_STEP_STATE_"; "")
+          | gsub("_"; " ")
+          | ascii_upcase;
+        .values[] |
+        "  \u001b[1;33m\(.uuid)\u001b[0m",
+        "     \(status) • started \((.started_on // "") | split("T")[0]) • completed \((.completed_on // "") | split("T")[0])",
+        "     \((.script_commands // []) | map(.name // .command // empty) | join(" | "))",
+        ""
+    '
+}
+
+resolve_pipeline_uuid() {
+    local pipeline_ref="$1"
+
+    if [[ "$pipeline_ref" =~ ^[0-9]+$ ]]; then
+        # Bitbucket accepts a build number in the {pipeline_uuid} path slot,
+        # even though the API only documents a uuid there. That turns the
+        # lookup into one request instead of walking the list backwards a page
+        # at a time. Measured against a repository whose newest build was
+        # #1300: `pipeline 1234` took 59.4s scanning 21 pages, and 0.6s this
+        # way.
+        #
+        # Do not be tempted by `?q=build_number=N` instead: the endpoint
+        # ACCEPTS that filter and silently ignores it, answering with the first
+        # page unfiltered. A wrong pipeline, not an error.
+        local direct_response direct_uuid
+        direct_response=$(bb_api "repositories/${WORKSPACE}/${REPO}/pipelines/${pipeline_ref}")
+        direct_uuid=$(echo "$direct_response" | jq -r '.uuid // empty' 2>/dev/null)
+        if [[ -n "$direct_uuid" && "$direct_uuid" != "null" ]]; then
+            encode_bb_uuid "$direct_uuid"
+            return 0
+        fi
+
+        # Fallback: scan the list. Kept because the direct form is undocumented,
+        # so it could stop working, and because the scan produces the better
+        # "latest build is #N" error when the number is simply too high.
+        local page=1
+        local response uuid
+
+        while true; do
+            response=$(bb_api "repositories/${WORKSPACE}/${REPO}/pipelines" "pagelen=100&page=${page}&sort=-created_on")
+
+            if [[ -z "$response" ]]; then
+                echo -e "${RED}Error:${NC} Empty Bitbucket API response while looking up pipeline build #${pipeline_ref}" >&2
+                return 1
+            fi
+
+            if bb_response_has_error "$response"; then
+                echo -e "${RED}Error:${NC} $(bb_response_error_message "$response")" >&2
+                return 1
+            fi
+
+            uuid=$(echo "$response" | jq -r --argjson build "$pipeline_ref" '.values[]? | select(.build_number == $build) | .uuid' | head -1)
+
+            if [[ -n "$uuid" && "$uuid" != "null" ]]; then
+                encode_bb_uuid "$uuid"
+                return 0
+            fi
+
+            if [[ "$page" -eq 1 ]]; then
+                local newest_build
+                newest_build=$(echo "$response" | jq -r '[.values[]?.build_number] | max // empty')
+                if [[ "$newest_build" =~ ^[0-9]+$ ]] && (( pipeline_ref > newest_build )); then
+                    echo -e "${RED}Error:${NC} Pipeline build #${pipeline_ref} not found (latest build is #${newest_build})" >&2
+                    return 1
+                fi
+            fi
+
+            if ! echo "$response" | jq -e '.next' > /dev/null 2>&1; then
+                echo -e "${RED}Error:${NC} Pipeline build #${pipeline_ref} not found" >&2
+                return 1
+            fi
+
+            page=$((page + 1))
+        done
+    fi
+
+    encode_bb_uuid "$pipeline_ref"
+}
+
+# ============================================================================
+# COMMAND: pipeline - Bitbucket Pipelines
+# ============================================================================
+cmd_pipeline() {
+    local action="list"
+    local pipeline_ref=""
+    local step_ref=""
+    local limit=20
+    local json_output=false
+    local branch=""
+    local status=""
+    local author=""
+    local repo_ref=""
+    local show_log=false
+    local custom=""
+    local exit_status=false
+    local rerun_failed=false
+
+    if [[ $# -gt 0 ]]; then
+        case "$1" in
+            list|ls)
+                action="list"
+                shift
+                ;;
+            --repo|-R|--repository|--repo=*|-R=*|--repository=*|--branch|-b|--branch=*|-b=*|--status|-s|--status=*|-s=*|--author|-a|--author=*|-a=*|--limit|-l|--limit=*|-l=*|--json|-j)
+                action="list"
+                ;;
+            view|show)
+                action="show"
+                shift
+                if [[ $# -gt 0 && "${1:-}" != -* ]]; then
+                    pipeline_ref="$1"
+                    shift
+                fi
+                ;;
+            cancel|stop)
+                action="cancel"
+                shift
+                if [[ $# -gt 0 && "${1:-}" != -* ]]; then
+                    pipeline_ref="$1"
+                    shift
+                fi
+                ;;
+            failures|failed)
+                action="failures"
+                shift
+                if [[ $# -gt 0 && "${1:-}" != -* ]]; then
+                    pipeline_ref="$1"
+                    shift
+                fi
+                ;;
+            trigger|run)
+                action="trigger"
+                shift
+                ;;
+            rerun)
+                action="rerun"
+                shift
+                if [[ $# -gt 0 && "${1:-}" != -* ]]; then
+                    pipeline_ref="$1"
+                    shift
+                fi
+                ;;
+            watch)
+                action="watch"
+                shift
+                if [[ $# -gt 0 && "${1:-}" != -* ]]; then
+                    pipeline_ref="$1"
+                    shift
+                fi
+                ;;
+            --help|-h)
+                cmd_pipeline_help
+                return 0
+                ;;
+            *)
+                action="show"
+                pipeline_ref="$1"
+                shift
+                ;;
+        esac
+    fi
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            steps)
+                action="steps"
+                shift
+                ;;
+            step)
+                action="step"
+                step_ref="${2:-}"
+                shift 2
+                ;;
+            view|show)
+                action="show"
+                shift
+                ;;
+            cancel|stop)
+                action="cancel"
+                shift
+                ;;
+            failures|failed)
+                action="failures"
+                shift
+                ;;
+            log)
+                show_log=true
+                shift
+                ;;
+            --log)
+                show_log=true
+                shift
+                ;;
+            --custom|-c)
+                custom="$2"
+                shift 2
+                ;;
+            --custom=*)
+                custom="${1#*=}"
+                shift
+                ;;
+            -c=*)
+                custom="${1#*=}"
+                shift
+                ;;
+            --repo|-R|--repository)
+                repo_ref="$2"
+                shift 2
+                ;;
+            --repo=*)
+                repo_ref="${1#*=}"
+                shift
+                ;;
+            -R=*)
+                repo_ref="${1#*=}"
+                shift
+                ;;
+            --repository=*)
+                repo_ref="${1#*=}"
+                shift
+                ;;
+            --branch|-b)
+                branch="$2"
+                shift 2
+                ;;
+            --branch=*)
+                branch="${1#*=}"
+                shift
+                ;;
+            -b=*)
+                branch="${1#*=}"
+                shift
+                ;;
+            --status|-s)
+                status="$2"
+                shift 2
+                ;;
+            --status=*)
+                status="${1#*=}"
+                shift
+                ;;
+            -s=*)
+                status="${1#*=}"
+                shift
+                ;;
+            --author|-a)
+                author="$2"
+                shift 2
+                ;;
+            --author=*)
+                author="${1#*=}"
+                shift
+                ;;
+            -a=*)
+                author="${1#*=}"
+                shift
+                ;;
+            --limit|-l)
+                limit="$2"
+                shift 2
+                ;;
+            --limit=*)
+                limit="${1#*=}"
+                shift
+                ;;
+            -l=*)
+                limit="${1#*=}"
+                shift
+                ;;
+            --json|-j)
+                json_output=true
+                shift
+                ;;
+            --exit-status)
+                exit_status=true
+                shift
+                ;;
+            --failed)
+                rerun_failed=true
+                shift
+                ;;
+            trigger|run)
+                action="trigger"
+                shift
+                ;;
+            watch)
+                action="watch"
+                shift
+                if [[ $# -gt 0 && "${1:-}" != -* ]]; then
+                    pipeline_ref="$1"
+                    shift
+                fi
+                ;;
+            rerun)
+                action="rerun"
+                shift
+                if [[ $# -gt 0 && "${1:-}" != -* ]]; then
+                    pipeline_ref="$1"
+                    shift
+                fi
+                ;;
+            --help|-h)
+                cmd_pipeline_help
+                return 0
+                ;;
+            *)
+                # A bare positional becomes the pipeline ref for show ONLY when no
+                # explicit subcommand set the action (else e.g. `rerun 1240` would
+                # be re-read as `show 1240`).
+                if [[ "$1" != -* && -z "$pipeline_ref" ]] && [[ -z "$action" || "$action" == "list" || "$action" == "show" ]]; then
+                    action="show"
+                    pipeline_ref="$1"
+                    shift
+                    continue
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    if [[ -n "$repo_ref" ]]; then
+        if ! set_repo_info_from_ref "$repo_ref"; then
+            echo -e "${RED}Error:${NC} Could not parse Bitbucket repository from: $repo_ref" >&2
+            return 1
+        fi
+    else
+        get_repo_info
+    fi
+    check_credentials
+
+    case "$action" in
+        list)
+            cmd_pipeline_list "$limit" "$branch" "$status" "$author" "$json_output"
+            ;;
+        show)
+            cmd_pipeline_show "$pipeline_ref" "$json_output"
+            ;;
+        steps)
+            cmd_pipeline_steps "$pipeline_ref" "$json_output"
+            ;;
+        step)
+            cmd_pipeline_step "$pipeline_ref" "$step_ref" "$show_log" "$json_output"
+            ;;
+        cancel)
+            cmd_pipeline_cancel "$pipeline_ref"
+            ;;
+        failures)
+            cmd_pipeline_failures "$pipeline_ref" "$json_output"
+            ;;
+        trigger)
+            cmd_pipeline_trigger "$branch" "$custom" "$json_output"
+            ;;
+        rerun)
+            cmd_pipeline_rerun "$pipeline_ref" "$json_output" "$rerun_failed"
+            ;;
+        watch)
+            cmd_pipeline_watch "$pipeline_ref" "$exit_status"
+            ;;
+    esac
+}
+
+cmd_pipeline_list() {
+    local limit="$1"
+    local branch="$2"
+    local status="$3"
+    local author="$4"
+    local json_output="$5"
+    local fetch_limit="$limit"
+    local params
+
+    if [[ -n "$branch" || -n "$status" || -n "$author" ]]; then
+        fetch_limit=100
+    fi
+
+    params="pagelen=${fetch_limit}&sort=-created_on"
+
+    local response filtered_response
+    response=$(bb_api "repositories/${WORKSPACE}/${REPO}/pipelines" "$params")
+
+    if echo "$response" | jq -e '.error' > /dev/null 2>&1; then
+        echo -e "${RED}Error:${NC} $(echo "$response" | jq -r '.error.message // .error')" >&2
+        return 1
+    fi
+
+    filtered_response=$(echo "$response" | jq \
+        --arg branch "$branch" \
+        --arg status_filter "$status" \
+        --arg author "$author" \
+        --argjson limit "$limit" '
+        def normalized_status:
+          (.state.result.name // .state.name // .state.stage.name // "UNKNOWN")
+          | tostring
+          | gsub("^PIPELINE_STATE_"; "")
+          | gsub("_"; " ")
+          | ascii_downcase;
+        def author_text:
+          [
+            .creator.display_name,
+            .creator.nickname,
+            .creator.account_id,
+            .creator.uuid
+          ]
+          | map(select(. != null))
+          | join(" ")
+          | ascii_downcase;
+        def branch_matches($branch):
+          if $branch == "" then true
+          elif ($branch | contains("/")) then (.target.ref_name // "") == $branch
+          else ((.target.ref_name // "") | contains($branch))
+          end;
+        .values |= [
+          .[] |
+          select(branch_matches($branch)) |
+          select(($status_filter == "") or (normalized_status | contains($status_filter | ascii_downcase))) |
+          select(($author == "") or (author_text | contains($author | ascii_downcase)))
+        ][: $limit]
+        | .size = (.values | length)
+    ')
+
+    if [[ "$json_output" == "true" ]]; then
+        echo "$filtered_response" | jq '.'
+        return 0
+    fi
+
+    echo ""
+    echo -e "${BLUE}Pipelines${NC} - ${WORKSPACE}/${REPO}"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    echo "$filtered_response" | print_pipeline_rows "$WORKSPACE" "$REPO"
+}
+
+cmd_pipeline_show() {
+    local pipeline_ref="$1"
+    local json_output="$2"
+
+    if [[ -z "$pipeline_ref" ]]; then
+        echo -e "${RED}Error:${NC} Pipeline UUID or build number is required" >&2
+        return 1
+    fi
+
+    local pipeline_uuid response steps_response
+    pipeline_uuid=$(resolve_pipeline_uuid "$pipeline_ref") || return 1
+
+    # The pipeline and its steps are independent; fetch them together.
+    local pipeline_file steps_file
+    pipeline_file="$(mktemp "${TMPDIR:-/tmp}/bb-cli-pipeline.XXXXXX")"
+    steps_file="$(mktemp "${TMPDIR:-/tmp}/bb-cli-steps.XXXXXX")"
+    bb_api "repositories/${WORKSPACE}/${REPO}/pipelines/${pipeline_uuid}" > "$pipeline_file" &
+    local pipeline_pid=$!
+    bb_api "repositories/${WORKSPACE}/${REPO}/pipelines/${pipeline_uuid}/steps" "pagelen=100" > "$steps_file" &
+    local steps_pid=$!
+    wait "$pipeline_pid" "$steps_pid" 2>/dev/null || true
+    response="$(cat "$pipeline_file")"
+    steps_response="$(cat "$steps_file")"
+    rm -f "$pipeline_file" "$steps_file"
+
+    if [[ "$json_output" == "true" ]]; then
+        jq -n --argjson pipeline "$response" --argjson steps "$steps_response" '{pipeline: $pipeline, steps: $steps}'
+        return 0
+    fi
+
+    echo ""
+    echo "$response" | jq -r '
+        def status:
+          (.state.result.name // .state.name // .state.stage.name // "UNKNOWN")
+          | tostring
+          | gsub("^PIPELINE_STATE_"; "")
+          | gsub("_"; " ")
+          | ascii_upcase;
+        def duration:
+          (if (.duration_in_seconds // 0) > 0 then .duration_in_seconds else .build_seconds_used end) as $s
+          | if $s == null then "N/A"
+            elif $s >= 3600 then "\(($s / 3600 | floor))h \((($s % 3600) / 60 | floor))m \($s % 60)s"
+            elif $s >= 60 then "\(($s / 60 | floor))m \($s % 60)s"
+            else "\($s)s"
+            end;
+        def pipeline_type: (.target.selector.type // .target.type // "N/A");
+        def trigger_type: (.trigger.type // .trigger.name // "N/A");
+        "Pipeline #\(.build_number) - \(status)",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "",
+        "  Status:        \(status)",
+        "  Duration:      \(duration)",
+        "  Ran by:        \(.creator.display_name // "unknown")",
+        "  Commit:        \(.target.commit.hash // "N/A")",
+        "  Branch:        \(.target.ref_name // "N/A")",
+        "  Pipeline type: \(pipeline_type)",
+        "  Trigger type:  \(trigger_type)",
+        "  UUID:          \(.uuid)",
+        "  Created:       \(.created_on | split("T")[0])",
+        "  Completed:     \((.completed_on // "") | split("T")[0])",
+        "  URL:           https://bitbucket.org/'"${WORKSPACE}"'/'"${REPO}"'/pipelines/results/\(.build_number)",
+        ""
+    '
+
+    echo -e "${BLUE}Steps${NC}"
+    echo "──────────────────────────────────────────────────────────"
+    echo "$steps_response" | print_step_rows
+}
+
+cmd_pipeline_steps() {
+    local pipeline_ref="$1"
+    local json_output="$2"
+
+    if [[ -z "$pipeline_ref" ]]; then
+        echo -e "${RED}Error:${NC} Pipeline UUID or build number is required" >&2
+        return 1
+    fi
+
+    local pipeline_uuid response
+    pipeline_uuid=$(resolve_pipeline_uuid "$pipeline_ref") || return 1
+    response=$(bb_api "repositories/${WORKSPACE}/${REPO}/pipelines/${pipeline_uuid}/steps" "pagelen=100")
+
+    if [[ "$json_output" == "true" ]]; then
+        echo "$response" | jq '.'
+        return 0
+    fi
+
+    echo ""
+    echo -e "${BLUE}Pipeline Steps${NC} - ${pipeline_ref}"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    echo "$response" | print_step_rows
+}
+
+cmd_pipeline_step() {
+    local pipeline_ref="$1"
+    local step_ref="$2"
+    local show_log="$3"
+    local json_output="$4"
+
+    if [[ -z "$pipeline_ref" || -z "$step_ref" ]]; then
+        echo -e "${RED}Error:${NC} Pipeline and step UUID are required" >&2
+        return 1
+    fi
+
+    local pipeline_uuid step_uuid response
+    pipeline_uuid=$(resolve_pipeline_uuid "$pipeline_ref") || return 1
+    step_uuid=$(encode_bb_uuid "$step_ref")
+
+    if [[ "$show_log" == "true" ]]; then
+        bb_api_raw "repositories/${WORKSPACE}/${REPO}/pipelines/${pipeline_uuid}/steps/${step_uuid}/log"
+        return 0
+    fi
+
+    response=$(bb_api "repositories/${WORKSPACE}/${REPO}/pipelines/${pipeline_uuid}/steps/${step_uuid}")
+
+    if [[ "$json_output" == "true" ]]; then
+        echo "$response" | jq '.'
+        return 0
+    fi
+
+    echo ""
+    echo "$response" | jq -r '
+        def status:
+          (.state.result.name // .state.name // .state.stage.name // "UNKNOWN")
+          | tostring
+          | gsub("^PIPELINE_STATE_"; "")
+          | gsub("^PIPELINE_STEP_STATE_"; "")
+          | gsub("_"; " ")
+          | ascii_upcase;
+        "Step \(.uuid) - \(status)",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "",
+        "  Started:   \((.started_on // "") | split("T")[0])",
+        "  Completed: \((.completed_on // "") | split("T")[0])",
+        "  Image:     \(.image.name // "N/A")",
+        "",
+        "Commands:",
+        ((.script_commands // [])[]? | "  - \(.name // .command // "")")
+    '
+    echo ""
+    echo -e "Use ${CYAN}bb-cli pipeline --repo=${WORKSPACE}/${REPO} ${pipeline_ref} step ${step_ref} --log${NC} to view the raw log."
+    echo ""
+}
+
+cmd_pipeline_failures() {
+    local pipeline_ref="$1"
+    local json_output="$2"
+
+    if [[ -z "$pipeline_ref" ]]; then
+        echo -e "${RED}Error:${NC} Pipeline UUID or build number is required" >&2
+        return 1
+    fi
+
+    local pipeline_uuid steps_response failed_steps
+    pipeline_uuid=$(resolve_pipeline_uuid "$pipeline_ref") || return 1
+    steps_response=$(bb_api "repositories/${WORKSPACE}/${REPO}/pipelines/${pipeline_uuid}/steps" "pagelen=100")
+    failed_steps=$(echo "$steps_response" | jq '[.values[]? | select(((.state.result.name // .state.name // "") | ascii_downcase) | contains("fail") or contains("error"))]')
+
+    if [[ "$json_output" == "true" ]]; then
+        jq -n --argjson failed_steps "$failed_steps" '{failed_steps: $failed_steps}'
+        return 0
+    fi
+
+    local count
+    count=$(echo "$failed_steps" | jq 'length')
+
+    echo ""
+    echo -e "${BLUE}Pipeline Failures${NC} - ${pipeline_ref}"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+
+    if [[ "$count" == "0" ]]; then
+        echo -e "${GREEN}No failed steps found.${NC}"
+        echo ""
+        return 0
+    fi
+
+    echo "$failed_steps" | jq -r '
+        def status:
+          (.state.result.name // .state.name // .state.stage.name // "UNKNOWN")
+          | tostring
+          | gsub("^PIPELINE_STATE_"; "")
+          | gsub("^PIPELINE_STEP_STATE_"; "")
+          | gsub("_"; " ")
+          | ascii_upcase;
+        .[] |
+        "  \u001b[1;31m\(.uuid)\u001b[0m - \(status)",
+        "     \((.script_commands // []) | map(.name // .command // empty) | join(" | "))",
+        ""
+    '
+
+    echo "Test reports:"
+    echo "──────────────────────────────────────────────────────────"
+
+    echo "$failed_steps" | jq -r '.[].uuid' | while read -r failed_step_uuid; do
+        local encoded_step report cases failed_cases
+        encoded_step=$(encode_bb_uuid "$failed_step_uuid")
+
+        # The summary and the individual cases are two independent reads per
+        # failed step. On a pipeline with several failures that halves the wait.
+        local report_file cases_file
+        report_file="$(mktemp "${TMPDIR:-/tmp}/bb-cli-report.XXXXXX")"
+        cases_file="$(mktemp "${TMPDIR:-/tmp}/bb-cli-cases.XXXXXX")"
+        bb_api "repositories/${WORKSPACE}/${REPO}/pipelines/${pipeline_uuid}/steps/${encoded_step}/test_reports" \
+            > "$report_file" &
+        local report_pid=$!
+        bb_api "repositories/${WORKSPACE}/${REPO}/pipelines/${pipeline_uuid}/steps/${encoded_step}/test_reports/test_cases" "pagelen=100" \
+            > "$cases_file" &
+        local cases_pid=$!
+        wait "$report_pid" "$cases_pid" 2>/dev/null || true
+        report="$(cat "$report_file")"
+        cases="$(cat "$cases_file")"
+        rm -f "$report_file" "$cases_file"
+
+        failed_cases=$(echo "$cases" | jq '[.values[]? | select(((.result // .state // .status // "") | tostring | ascii_downcase) | contains("fail") or contains("error"))]' 2>/dev/null || echo "[]")
+
+        echo "  Step ${failed_step_uuid}"
+        if echo "$report" | jq -e '.error' > /dev/null 2>&1; then
+            echo "    No test report available."
+        else
+            echo "$report" | jq -r 'to_entries[]? | "    \(.key): \(.value)"' 2>/dev/null | head -20
+            if [[ "$(echo "$failed_cases" | jq 'length')" -gt 0 ]]; then
+                echo "$failed_cases" | jq -r '.[] | "    - \(.name // .class_name // .uuid // "failed test")"' | head -20
+            fi
+        fi
+        echo -e "    Log: ${CYAN}bb-cli pipeline --repo=${WORKSPACE}/${REPO} ${pipeline_ref} step ${failed_step_uuid} --log${NC}"
+        echo ""
+    done
+}
+
+cmd_pipeline_trigger() {
+    local branch="$1"
+    local custom="$2"
+    local json_output="$3"
+    local body response
+
+    if [[ -z "$branch" ]]; then
+        branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+    fi
+    if [[ -z "$branch" || "$branch" == "HEAD" ]]; then
+        echo -e "${RED}Error:${NC} No branch given. Use --branch <name> (or run inside a git checkout)." >&2
+        return 1
+    fi
+
+    if [[ -n "$custom" ]]; then
+        body=$(jq -n --arg branch "$branch" --arg pattern "$custom" \
+            '{target: {type: "pipeline_ref_target", ref_type: "branch", ref_name: $branch, selector: {type: "custom", pattern: $pattern}}}')
+    else
+        body=$(jq -n --arg branch "$branch" \
+            '{target: {type: "pipeline_ref_target", ref_type: "branch", ref_name: $branch}}')
+    fi
+
+    response=$(bb_api_post "repositories/${WORKSPACE}/${REPO}/pipelines/" "$body")
+
+    if [[ -z "$response" ]] || bb_response_has_error "$response"; then
+        echo -e "${RED}Error:${NC} Could not trigger pipeline: $(bb_response_error_message "${response:-empty response}")" >&2
+        return 1
+    fi
+
+    if [[ "$json_output" == true ]]; then
+        echo "$response" | jq .
+        return 0
+    fi
+
+    print_triggered_pipeline "$response" "Triggered"
+}
+
+cmd_pipeline_rerun() {
+    local pipeline_ref="$1"
+    local json_output="$2"
+    local rerun_failed="${3:-false}"
+    local pipeline_uuid response target body
+
+    if [[ -z "$pipeline_ref" ]]; then
+        echo -e "${RED}Error:${NC} Usage: bb-cli pipeline rerun <build_number|uuid> [--failed]" >&2
+        return 1
+    fi
+
+    # gh analog: `gh run rerun --failed`. Bitbucket's PUBLIC REST API has no
+    # endpoint to rerun only the failed steps (open feature request; the UI's
+    # "Rerun failed steps" uses the undocumented api.bitbucket.org/internal API).
+    # Rerunning the ENTIRE pipeline is the only public-API option, so be explicit
+    # rather than silently doing something different from what --failed implies.
+    if [[ "$rerun_failed" == true ]]; then
+        echo -e "${YELLOW}Note:${NC} Bitbucket's public API cannot rerun only failed steps." >&2
+        echo -e "      Use the web UI ('Rerun failed steps') for that, or rerun the whole" >&2
+        echo -e "      pipeline with: ${CYAN}bb-cli pipeline rerun ${pipeline_ref}${NC} (no --failed)." >&2
+        return 2
+    fi
+
+    pipeline_uuid=$(resolve_pipeline_uuid "$pipeline_ref") || return 1
+
+    response=$(bb_api "repositories/${WORKSPACE}/${REPO}/pipelines/$(encode_bb_uuid "$pipeline_uuid")")
+    if [[ -z "$response" ]] || bb_response_has_error "$response"; then
+        echo -e "${RED}Error:${NC} Could not load pipeline ${pipeline_ref}: $(bb_response_error_message "${response:-empty response}")" >&2
+        return 1
+    fi
+
+    # The public API has no rerun endpoint; re-post the same target (branch,
+    # commit-less so it picks up the branch head, and custom selector if any).
+    target=$(echo "$response" | jq '.target | {type, ref_type, ref_name}
+        + (if .selector and .selector.type == "custom" then {selector: {type: .selector.type, pattern: .selector.pattern}} else {} end)')
+    if [[ -z "$target" || "$target" == "null" ]]; then
+        echo -e "${RED}Error:${NC} Pipeline ${pipeline_ref} has no branch target to re-run." >&2
+        return 1
+    fi
+
+    body=$(jq -n --argjson target "$target" '{target: $target}')
+    response=$(bb_api_post "repositories/${WORKSPACE}/${REPO}/pipelines/" "$body")
+
+    if [[ -z "$response" ]] || bb_response_has_error "$response"; then
+        echo -e "${RED}Error:${NC} Could not re-run pipeline: $(bb_response_error_message "${response:-empty response}")" >&2
+        return 1
+    fi
+
+    if [[ "$json_output" == true ]]; then
+        echo "$response" | jq .
+        return 0
+    fi
+
+    print_triggered_pipeline "$response" "Re-ran as new"
+}
+
+print_triggered_pipeline() {
+    local response="$1"
+    local verb="$2"
+    local build state branch_name pattern
+
+    build=$(echo "$response" | jq -r '.build_number')
+    state=$(echo "$response" | pipeline_status_label)
+    branch_name=$(echo "$response" | jq -r '.target.ref_name // "?"')
+    pattern=$(echo "$response" | jq -r '.target.selector.pattern // "default"')
+
+    echo -e "${GREEN}${verb} pipeline #${build}${NC} (${state})"
+    echo -e "  Branch:   ${branch_name}"
+    echo -e "  Pipeline: ${pattern}"
+    echo -e "  URL:      https://bitbucket.org/${WORKSPACE}/${REPO}/pipelines/results/${build}"
+    echo -e "  Watch:    ${CYAN}bb-cli pipeline watch ${build}${NC}"
+}
+
+cmd_pipeline_watch() {
+    local pipeline_ref="$1"
+    local exit_status="$2"
+    local pipeline_uuid response state last_state="" build
+
+    if [[ -z "$pipeline_ref" ]]; then
+        echo -e "${RED}Error:${NC} Usage: bb-cli pipeline watch <build_number|uuid> [--exit-status]" >&2
+        return 1
+    fi
+
+    pipeline_uuid=$(resolve_pipeline_uuid "$pipeline_ref") || return 1
+
+    while true; do
+        response=$(bb_api "repositories/${WORKSPACE}/${REPO}/pipelines/$(encode_bb_uuid "$pipeline_uuid")")
+        if [[ -z "$response" ]] || bb_response_has_error "$response"; then
+            echo -e "${YELLOW}Warning:${NC} transient API error, retrying..." >&2
+            sleep 15
+            continue
+        fi
+
+        build=$(echo "$response" | jq -r '.build_number')
+        state=$(echo "$response" | pipeline_status_label)
+        if [[ "$state" != "$last_state" ]]; then
+            echo "$(date '+%H:%M:%S') pipeline #${build}: ${state}"
+            last_state="$state"
+        fi
+
+        case "$state" in
+            SUCCESSFUL)
+                return 0
+                ;;
+            FAILED|ERROR|STOPPED|EXPIRED)
+                [[ "$exit_status" == true ]] && return 1
+                return 0
+                ;;
+        esac
+        sleep 30
+    done
+}
+
+# gh run cancel. Bitbucket calls it stopPipeline.
+cmd_pipeline_cancel() {
+    local pipeline_ref="$1"
+
+    if [[ -z "$pipeline_ref" ]]; then
+        echo -e "${RED}Error:${NC} which build? ${CYAN}bb-cli pipeline cancel <number>${NC}" >&2
+        return 1
+    fi
+
+    local pipeline_uuid
+    pipeline_uuid=$(resolve_pipeline_uuid "$pipeline_ref") || return 1
+
+    local rc=0
+    api_request POST \
+        "https://api.bitbucket.org/2.0/repositories/${WORKSPACE}/${REPO}/pipelines/${pipeline_uuid}/stopPipeline" || rc=$?
+
+    if [[ $rc -ne 0 ]]; then
+        api_cleanup
+        echo -e "${RED}Error:${NC} could not reach Bitbucket" >&2
+        return 1
+    fi
+
+    if api_status_is_error; then
+        local err="$API_STATUS"
+        local body
+        body="$(cat "$API_BODY_FILE" 2>/dev/null)"
+        api_cleanup
+        API_STATUS="$err"
+        # A completed build answers 400, not 403: authorisation passed and the
+        # state refused. Say that, rather than letting it read as a permission
+        # problem.
+        if [[ "$err" == "400" ]] && [[ "$body" == *"already complete"* ]]; then
+            echo ""
+            echo -e "  ${YELLOW}Build #${pipeline_ref} has already finished.${NC} Nothing to cancel."
+            echo ""
+            return 1
+        fi
+        printf '%s' "$body" | jq . 2>/dev/null || printf '%s\n' "$body"
+        api_report_error "cancelling build #${pipeline_ref}"
+        return 1
+    fi
+    api_cleanup
+
+    echo ""
+    echo -e "  ${GREEN}✓${NC} Cancelled build #${pipeline_ref}"
+    echo ""
+    echo -e "  ${YELLOW}Only cancel builds that are yours.${NC} See ${CYAN}bb-cli docs pipelines${NC}."
+    echo ""
+}
+
+cmd_pipeline_help() {
+    cat << 'EOF'
+Usage: bb-cli pipeline [list] [options]
+       bb-cli pipeline <uuid|build_number> [options]
+       bb-cli pipeline <uuid|build_number> steps [options]
+       bb-cli pipeline <uuid|build_number> step <step_uuid> [--log] [options]
+       bb-cli pipeline <uuid|build_number> failures [options]
+       bb-cli pipeline failures <uuid|build_number> [options]
+       bb-cli pipeline trigger [--branch <name>] [--custom <pattern>] [options]
+       bb-cli pipeline rerun <uuid|build_number> [options]
+       bb-cli pipeline watch <uuid|build_number> [--exit-status] [options]
+
+Options:
+  -R, --repo        Repository as workspace/repo or Bitbucket URL
+  -b, --branch      Filter list by branch/ref name; branch to trigger on
+  -s, --status      Filter list by pipeline status
+  -a, --author      Filter list by creator/display name
+  -l, --limit       Max pipelines in list (default: 20)
+  -c, --custom      Custom pipeline name for trigger (e.g. "Unit specs")
+  --log             Show raw log for a step
+  --exit-status     watch: exit non-zero when the pipeline fails (gh-style)
+  -j, --json        Output raw JSON
+
+Trigger/rerun/watch mirror the gh CLI shapes (gh workflow run / gh run rerun /
+gh run watch). Note: the Bitbucket public API has no "rerun failed steps";
+rerun re-posts the same target (branch head + custom selector) as a NEW build.
+
+Examples:
+  bb-cli pipeline
+  bb-cli pipeline --repo myworkspace/myrepo
+  bb-cli pipeline --repo https://bitbucket.org/myworkspace/myrepo/src/master/
+  bb-cli pipeline --branch=feature/my-feature
+  bb-cli pipeline --author alice --status failed
+  bb-cli pipeline --branch master --limit 10
+  bb-cli pipeline 1234
+  bb-cli pipeline 1234 steps
+  bb-cli pipeline 1234 step '{a1b2c3d4-5e6f-7890-abcd-ef1234567890}'
+  bb-cli pipeline 1234 step '{a1b2c3d4-5e6f-7890-abcd-ef1234567890}' --log
+  bb-cli pipeline 1234 failures
+  bb-cli pipeline trigger --branch jp/my-branch --custom "Unit specs"
+  bb-cli pipeline trigger -c "Unit specs"        # branch from current checkout
+  bb-cli pipeline rerun 1235
+  bb-cli pipeline watch 1236 --exit-status
+EOF
+}
+
+# ============================================================================
+# COMMAND: pr - Pull Requests
+# ============================================================================
+cmd_pr() {
+    local state="OPEN"
+    local limit=25
+    local json_output=false
+    local branch=""
+    local target=""
+    local author=""
+    local action="list"
+    local pr_id=""
+    local show_comments=false
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            view)
+                shift
+                if [[ $# -gt 0 && "$1" =~ ^[0-9]+$ ]]; then
+                    action="show"
+                    pr_id="$1"
+                    shift
+                fi
+                ;;
+            edit | ready | comment)
+                # gh pr edit|ready|comment. These own the rest of the line.
+                local verb="$1"
+                shift
+                if [[ $# -eq 0 || ! "$1" =~ ^[0-9]+$ ]]; then
+                    echo -e "${RED}Error:${NC} which pull request? ${CYAN}bb-cli pr ${verb} <number>${NC}" >&2
+                    return 1
+                fi
+                pr_id="$1"
+                shift
+                get_repo_info
+                check_credentials
+                case "$verb" in
+                    edit) cmd_pr_edit "$pr_id" "$@" ;;
+                    ready) cmd_pr_ready "$pr_id" "$@" ;;
+                    comment) cmd_pr_comment "$pr_id" "$@" ;;
+                esac
+                return $?
+                ;;
+            checks)
+                shift
+                if [[ $# -gt 0 && "$1" =~ ^[0-9]+$ ]]; then
+                    action="checks"
+                    pr_id="$1"
+                    shift
+                fi
+                ;;
+            list|open|merged|declined)
+                action="$1"
+                [[ "$1" == "open" ]] && state="OPEN"
+                [[ "$1" == "merged" ]] && state="MERGED"
+                [[ "$1" == "declined" ]] && state="DECLINED"
+                shift
+                ;;
+            --branch|-b)
+                branch="$2"
+                shift 2
+                ;;
+            --state|-s)
+                state="$(echo "$2" | tr '[:lower:]' '[:upper:]')"
+                shift 2
+                ;;
+            --target|-t)
+                target="$2"
+                shift 2
+                ;;
+            --author|-a)
+                author="$2"
+                shift 2
+                ;;
+            --limit|-l)
+                limit="$2"
+                shift 2
+                ;;
+            --comments|-c)
+                show_comments=true
+                shift
+                ;;
+            --json|-j)
+                json_output=true
+                shift
+                ;;
+            --help|-h)
+                cmd_pr_help
+                return 0
+                ;;
+            *)
+                # Number only = PR ID, string with letters = branch filter
+                if [[ "$1" =~ ^[0-9]+$ ]]; then
+                    action="show"
+                    pr_id="$1"
+                elif [[ "$1" != -* ]]; then
+                    # String with non-numeric chars = branch filter
+                    branch="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    get_repo_info
+    check_credentials
+
+    # Show PR details if action is show
+    if [[ "$action" == "checks" ]]; then
+        cmd_pr_checks "$pr_id" "$json_output"
+        return $?
+    fi
+
+    if [[ "$action" == "show" ]]; then
+        cmd_pr_show "$pr_id" "$show_comments" "$json_output"
+        return $?
+    fi
+
+    # Fetch PRs
+    local response
+    response=$(bb_api "repositories/${WORKSPACE}/${REPO}/pullrequests" "state=${state}&pagelen=${limit}")
+
+    # Check for errors
+    if echo "$response" | jq -e '.error' > /dev/null 2>&1; then
+        echo -e "${RED}Error:${NC} $(echo "$response" | jq -r '.error.message // .error')" >&2
+        return 1
+    fi
+
+    # Apply filters
+    if [[ -n "$branch" ]]; then
+        response=$(echo "$response" | jq --arg branch "$branch" '
+            .values |= [.[] | select(.source.branch.name | contains($branch))]
+        ')
+    fi
+
+    if [[ -n "$target" ]]; then
+        response=$(echo "$response" | jq --arg target "$target" '
+            .values |= [.[] | select(.destination.branch.name | contains($target))]
+        ')
+    fi
+
+    if [[ -n "$author" ]]; then
+        response=$(echo "$response" | jq --arg author "$author" '
+            .values |= [.[] | select(.author.display_name | ascii_downcase | contains($author | ascii_downcase))]
+        ')
+    fi
+
+    # Output
+    if [[ "$json_output" == "true" ]]; then
+        echo "$response" | jq '.'
+        return 0
+    fi
+
+    local count
+    count=$(echo "$response" | jq '.values | length')
+
+    if [[ "$count" == "0" ]]; then
+        echo ""
+        echo -e "${YELLOW}No pull requests found.${NC}"
+        echo ""
+        echo "Filters: state=$state"
+        [[ -n "$branch" ]] && echo "         branch contains '$branch'"
+        [[ -n "$target" ]] && echo "         target contains '$target'"
+        [[ -n "$author" ]] && echo "         author contains '$author'"
+        return 0
+    fi
+
+    echo ""
+    echo -e "${BLUE}Pull Requests (${state})${NC} - ${WORKSPACE}/${REPO}"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+
+    echo "$response" | jq -r '
+        .values[] |
+        "  \u001b[1;33m#\(.id)\u001b[0m \(.title)",
+        "     \u001b[0;36m\(.source.branch.name)\u001b[0m → \(.destination.branch.name)",
+        "     by \(.author.display_name) • \(.updated_on | split("T")[0])",
+        "     \(.links.html.href)",
+        ""
+    '
+
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo -e "  Total: ${GREEN}${count}${NC} PR(s)"
+    echo ""
+}
+
+# Show PR details
+cmd_pr_show() {
+    local pr_id="$1"
+    local show_comments="$2"
+    local json_output="${3:-false}"
+
+    # Fetch PR details through the shared HTTP layer, so a 403 explains itself
+    # the same way it does everywhere else.
+    local pr_response rc=0
+    api_request GET \
+        "https://api.bitbucket.org/2.0/repositories/${WORKSPACE}/${REPO}/pullrequests/${pr_id}" || rc=$?
+
+    if [[ $rc -ne 0 ]]; then
+        api_cleanup
+        echo -e "${RED}Error:${NC} could not reach Bitbucket" >&2
+        return 1
+    fi
+    if api_status_is_error; then
+        local err_status="$API_STATUS"
+        api_cleanup
+        API_STATUS="$err_status"
+        echo ""
+        echo -e "${RED}Error:${NC} PR #${pr_id} not available (HTTP ${err_status})" >&2
+        api_report_error "reading pull request #${pr_id}"
+        echo ""
+        return 1
+    fi
+    pr_response="$(cat "$API_BODY_FILE")"
+    api_cleanup
+
+    # Check for JSON errors
+    if ! echo "$pr_response" | jq -e '.id' > /dev/null 2>&1; then
+        echo ""
+        echo -e "${RED}Error:${NC} Invalid response for PR #${pr_id}" >&2
+        echo ""
+        return 1
+    fi
+
+    # -j/--json: the whole payload, description included. This flag used to be
+    # parsed and then dropped on the show path, which is what sent sessions
+    # back to curl just to read a PR body.
+    if [[ "$json_output" == true ]]; then
+        echo "$pr_response" | jq .
+        return 0
+    fi
+
+    # Extract PR info
+    local title state author source_branch dest_branch created_on updated_on url
+    title=$(echo "$pr_response" | jq -r '.title')
+    state=$(echo "$pr_response" | jq -r '.state')
+    author=$(echo "$pr_response" | jq -r '.author.display_name')
+    source_branch=$(echo "$pr_response" | jq -r '.source.branch.name')
+    dest_branch=$(echo "$pr_response" | jq -r '.destination.branch.name')
+    created_on=$(echo "$pr_response" | jq -r '.created_on | split("T")[0]')
+    updated_on=$(echo "$pr_response" | jq -r '.updated_on | split("T")[0]')
+    url=$(echo "$pr_response" | jq -r '.links.html.href')
+
+    # Comments and activity are independent of each other, so they go out
+    # together rather than one after the other. On a normal connection that is
+    # the difference between roughly 600ms and roughly 300ms of waiting.
+    #
+    # There used to be a third fetch here, for participants with
+    # ?fields=participants. Nothing read it: the reviewers section below reads
+    # .participants out of $pr_response, which already carries them. It was a
+    # whole round trip per `bb-cli pr <n>` spent on a variable never used.
+    local comments_file activity_file
+    comments_file="$(mktemp "${TMPDIR:-/tmp}/bb-cli-comments.XXXXXX")"
+    activity_file="$(mktemp "${TMPDIR:-/tmp}/bb-cli-activity.XXXXXX")"
+
+    bb_api "repositories/${WORKSPACE}/${REPO}/pullrequests/${pr_id}/comments" "pagelen=50" \
+        > "$comments_file" &
+    local comments_pid=$!
+    bb_api "repositories/${WORKSPACE}/${REPO}/pullrequests/${pr_id}/activity" "pagelen=15" \
+        > "$activity_file" &
+    local activity_pid=$!
+    wait "$comments_pid" "$activity_pid" 2>/dev/null || true
+
+    local comments_response activity_response
+    comments_response="$(cat "$comments_file")"
+    activity_response="$(cat "$activity_file")"
+    rm -f "$comments_file" "$activity_file"
+
+    # Display header
+    echo ""
+    echo -e "${BLUE}PR #${pr_id}${NC} - ${title}"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+
+    # State with color
+    local state_color="${GREEN}"
+    [[ "$state" == "MERGED" ]] && state_color="${CYAN}"
+    [[ "$state" == "DECLINED" ]] && state_color="${RED}"
+
+    echo -e "  State:   ${state_color}${state}${NC}"
+    echo -e "  Author:  ${author}"
+    echo -e "  Branch:  ${CYAN}${source_branch}${NC} → ${dest_branch}"
+    echo -e "  Created: ${created_on}"
+    echo -e "  Updated: ${updated_on}"
+    echo -e "  URL:     ${url}"
+
+    # Description. Reading a PR body was the single most common reason a
+    # session dropped to curl, so it is printed here rather than only in --json.
+    local pr_description
+    pr_description=$(echo "$pr_response" | jq -r '.description // ""')
+    if [[ -n "$pr_description" ]]; then
+        echo ""
+        echo -e "${BLUE}Description${NC}"
+        echo "──────────────────────────────────────────────────────────"
+        echo ""
+        printf '%s\n' "$pr_description" | sed 's/^/  /'
+    fi
+
+    # Reviewers section
+    echo ""
+    echo -e "${BLUE}Reviewers${NC}"
+    echo "──────────────────────────────────────────────────────────"
+
+    local has_reviewers=false
+    echo "$pr_response" | jq -r '
+        .participants[]? |
+        select(.role == "REVIEWER") |
+        if .user.display_name | test("Rovo"; "i") then
+            "  🤖 \(.user.display_name) \u001b[0;36m(automated)\u001b[0m"
+        elif .approved then
+            "  ✅ \(.user.display_name) - Approved"
+        elif .state == "changes_requested" then
+            "  🔄 \(.user.display_name) - Changes Requested"
+        else
+            "  ⏳ \(.user.display_name) - Pending"
+        end
+    ' 2>/dev/null | while read -r line; do
+        has_reviewers=true
+        echo "$line"
+    done
+
+    # Comments summary
+    echo ""
+    echo -e "${BLUE}Comments${NC}"
+    echo "──────────────────────────────────────────────────────────"
+
+    local human_comments rovo_comments
+    human_comments=$(echo "$comments_response" | jq '[.values[] | select(.user.display_name | test("Rovo"; "i") | not)] | length')
+    rovo_comments=$(echo "$comments_response" | jq '[.values[] | select(.user.display_name | test("Rovo"; "i"))] | length')
+
+    echo -e "  Human comments: ${human_comments}"
+    [[ "$rovo_comments" -gt 0 ]] && echo -e "  Rovo comments:  ${rovo_comments} ${CYAN}(automated)${NC}"
+
+    # Recent activity
+    echo ""
+    echo -e "${BLUE}Recent Activity${NC}"
+    echo "──────────────────────────────────────────────────────────"
+
+    echo "$activity_response" | jq -r '
+        .values[:10][] |
+        if .update then
+            "  ● \(.update.date | split("T")[0]) - \(.update.author.display_name) pushed commits"
+        elif .comment then
+            "  💬 \(.comment.created_on | split("T")[0]) - \(.comment.user.display_name) commented"
+        elif .approval then
+            "  ✅ \(.approval.date | split("T")[0]) - \(.approval.user.display_name) approved"
+        elif .changes_requested then
+            "  🔄 \(.changes_requested.date | split("T")[0]) - \(.changes_requested.user.display_name) requested changes"
+        else
+            empty
+        end
+    ' 2>/dev/null | head -10
+
+    # Show comments if requested
+    if [[ "$show_comments" == "true" ]]; then
+        echo ""
+        echo -e "${BLUE}Comments Detail${NC}"
+        echo "──────────────────────────────────────────────────────────"
+
+        echo "$comments_response" | jq -r '
+            .values[] |
+            select(.user.display_name | test("Rovo"; "i") | not) |
+            select(.deleted == false) |
+            "",
+            "  \u001b[1;33m\(.user.display_name)\u001b[0m • \(.created_on | split("T")[0])",
+            "  File: \(.inline.path // "general")",
+            "  \(.content.raw | split("\n")[0:3] | join("\n  "))",
+            ""
+        ' 2>/dev/null
+    fi
+
+    echo ""
+}
+
+# gh pr checks. On Bitbucket the checks on a pull request are the build
+# statuses on its source commit - the same objects `bb-cli signoff` writes.
+cmd_pr_checks() {
+    local pr_id="$1"
+    local json_output="${2:-false}"
+
+    local rc=0
+    api_request GET \
+        "https://api.bitbucket.org/2.0/repositories/${WORKSPACE}/${REPO}/pullrequests/${pr_id}" || rc=$?
+
+    if [[ $rc -ne 0 ]]; then
+        api_cleanup
+        echo -e "${RED}Error:${NC} could not reach Bitbucket" >&2
+        return 1
+    fi
+    if api_status_is_error; then
+        local err="$API_STATUS"
+        api_cleanup
+        API_STATUS="$err"
+        api_report_error "reading pull request #${pr_id}"
+        return 1
+    fi
+
+    local sha
+    sha="$(jq -r '.source.commit.hash // empty' < "$API_BODY_FILE" 2>/dev/null)"
+    api_cleanup
+
+    if [[ -z "$sha" ]]; then
+        echo -e "${RED}Error:${NC} could not find the head commit of PR #${pr_id}" >&2
+        return 1
+    fi
+
+    cmd_signoff_status "$sha" "$json_output"
+}
+
+# ----------------------------------------------------------------------------
+# Pull request writes: edit, ready, comment. The `gh pr edit|ready|comment` set.
+#
+# Every body here comes from a file or stdin rather than an inline string.
+# Descriptions are multi-line markdown, and trailing spaces are markdown's hard
+# line break, which command substitution strips - so `--body "$(cat f)"` quietly
+# produces a different document from the one on disk.
+# ----------------------------------------------------------------------------
+
+# Read a body from --body / --body-file, honouring "-" as stdin.
+# Sets BB_BODY_TEXT. Returns 1 with a message when the file is unreadable.
+bb_read_body() {
+    local literal="$1"
+    local file="$2"
+
+    if [[ -n "$file" ]]; then
+        if [[ "$file" == "-" ]]; then
+            BB_BODY_TEXT="$(cat)"
+        elif [[ -r "$file" && ! -d "$file" ]]; then
+            BB_BODY_TEXT="$(cat "$file")"
+        else
+            echo -e "${RED}Error:${NC} cannot read ${file}" >&2
+            return 1
+        fi
+    else
+        BB_BODY_TEXT="$literal"
+    fi
+    return 0
+}
+
+cmd_pr_edit() {
+    local pr_id="$1"
+    shift
+
+    local title="" title_set=false
+    local body="" body_file="" body_set=false
+    local dry_run=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -t | --title) title="$2"; title_set=true; shift 2 ;;
+            --title=*) title="${1#*=}"; title_set=true; shift ;;
+            -b | --body) body="$2"; body_set=true; shift 2 ;;
+            --body=*) body="${1#*=}"; body_set=true; shift ;;
+            -F | --body-file | --description-file) body_file="$2"; body_set=true; shift 2 ;;
+            --body-file=* | --description-file=*) body_file="${1#*=}"; body_set=true; shift ;;
+            --dry-run) dry_run=true; shift ;;
+            -h | --help) cmd_pr_help; return 0 ;;
+            *) echo -e "${RED}Error:${NC} unexpected argument: $1" >&2; return 1 ;;
+        esac
+    done
+
+    if [[ "$title_set" == false && "$body_set" == false ]]; then
+        echo -e "${RED}Error:${NC} nothing to change" >&2
+        echo "  Pass --title, or --body-file (recommended for markdown), or both." >&2
+        return 1
+    fi
+
+    BB_BODY_TEXT=""
+    if [[ "$body_set" == true ]]; then
+        bb_read_body "$body" "$body_file" || return 1
+    fi
+
+    # Read the current pull request first. Bitbucket's PUT replaces the fields
+    # it is given, and omitting one is not the same as leaving it alone in every
+    # client - so send both, with the current value for whichever was not named.
+    local rc=0
+    api_request GET \
+        "https://api.bitbucket.org/2.0/repositories/${WORKSPACE}/${REPO}/pullrequests/${pr_id}" || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        api_cleanup
+        echo -e "${RED}Error:${NC} could not reach Bitbucket" >&2
+        return 1
+    fi
+    if api_status_is_error; then
+        local err="$API_STATUS"
+        api_cleanup
+        API_STATUS="$err"
+        api_report_error "reading pull request #${pr_id}"
+        return 1
+    fi
+
+    local current_title current_body
+    current_title="$(jq -r '.title // ""' < "$API_BODY_FILE")"
+    current_body="$(jq -r '.description // ""' < "$API_BODY_FILE")"
+    api_cleanup
+
+    [[ "$title_set" == true ]] || title="$current_title"
+    [[ "$body_set" == true ]] || BB_BODY_TEXT="$current_body"
+
+    local payload
+    payload="$(jq -nc --arg t "$title" --arg d "$BB_BODY_TEXT" '{title: $t, description: $d}')"
+
+    if [[ "$dry_run" == true ]]; then
+        echo "PUT https://api.bitbucket.org/2.0/repositories/${WORKSPACE}/${REPO}/pullrequests/${pr_id}"
+        printf '%s' "$payload" | jq .
+        return 0
+    fi
+
+    rc=0
+    api_request PUT \
+        "https://api.bitbucket.org/2.0/repositories/${WORKSPACE}/${REPO}/pullrequests/${pr_id}" \
+        -H "Content-Type: application/json" --data-binary "$payload" || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        api_cleanup
+        echo -e "${RED}Error:${NC} could not reach Bitbucket" >&2
+        return 1
+    fi
+    if api_status_is_error; then
+        local err="$API_STATUS"
+        cat "$API_BODY_FILE" 2>/dev/null
+        api_cleanup
+        API_STATUS="$err"
+        api_report_error "editing pull request #${pr_id}"
+        return 1
+    fi
+
+    local url
+    url="$(jq -r '.links.html.href // ""' < "$API_BODY_FILE" 2>/dev/null)"
+    api_cleanup
+
+    echo ""
+    echo -e "  ${GREEN}✓${NC} Updated PR #${pr_id}"
+    echo -e "    ${title}"
+    [[ -n "$url" ]] && echo -e "    ${CYAN}${url}${NC}"
+    echo ""
+}
+
+cmd_pr_ready() {
+    local pr_id="$1"
+    shift
+
+    local draft=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --undo) draft=true; shift ;;
+            -h | --help) cmd_pr_help; return 0 ;;
+            *) echo -e "${RED}Error:${NC} unexpected argument: $1" >&2; return 1 ;;
+        esac
+    done
+
+    local payload
+    payload="$(jq -nc --argjson d "$draft" '{draft: $d}')"
+
+    local rc=0
+    api_request PUT \
+        "https://api.bitbucket.org/2.0/repositories/${WORKSPACE}/${REPO}/pullrequests/${pr_id}" \
+        -H "Content-Type: application/json" --data-binary "$payload" || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        api_cleanup
+        echo -e "${RED}Error:${NC} could not reach Bitbucket" >&2
+        return 1
+    fi
+    if api_status_is_error; then
+        local err="$API_STATUS"
+        cat "$API_BODY_FILE" 2>/dev/null
+        api_cleanup
+        API_STATUS="$err"
+        api_report_error "changing draft state of pull request #${pr_id}"
+        return 1
+    fi
+    api_cleanup
+
+    echo ""
+    if [[ "$draft" == true ]]; then
+        echo -e "  ${GREEN}✓${NC} PR #${pr_id} is back to draft"
+    else
+        echo -e "  ${GREEN}✓${NC} PR #${pr_id} is ready for review"
+    fi
+    echo ""
+}
+
+cmd_pr_comment() {
+    local pr_id="$1"
+    shift
+
+    local body="" body_file="" body_set=false
+    local dry_run=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -b | --body) body="$2"; body_set=true; shift 2 ;;
+            --body=*) body="${1#*=}"; body_set=true; shift ;;
+            -F | --body-file) body_file="$2"; body_set=true; shift 2 ;;
+            --body-file=*) body_file="${1#*=}"; body_set=true; shift ;;
+            --dry-run) dry_run=true; shift ;;
+            -h | --help) cmd_pr_help; return 0 ;;
+            *) echo -e "${RED}Error:${NC} unexpected argument: $1" >&2; return 1 ;;
+        esac
+    done
+
+    if [[ "$body_set" == false ]]; then
+        echo -e "${RED}Error:${NC} a comment needs a body" >&2
+        echo "  Use --body-file <file> (or - for stdin); --body works for one-liners." >&2
+        return 1
+    fi
+
+    BB_BODY_TEXT=""
+    bb_read_body "$body" "$body_file" || return 1
+
+    if [[ -z "$BB_BODY_TEXT" ]]; then
+        echo -e "${RED}Error:${NC} refusing to post an empty comment" >&2
+        return 1
+    fi
+
+    local payload
+    payload="$(jq -nc --arg raw "$BB_BODY_TEXT" '{content: {raw: $raw}}')"
+
+    if [[ "$dry_run" == true ]]; then
+        echo "POST https://api.bitbucket.org/2.0/repositories/${WORKSPACE}/${REPO}/pullrequests/${pr_id}/comments"
+        printf '%s' "$payload" | jq .
+        return 0
+    fi
+
+    local rc=0
+    api_request POST \
+        "https://api.bitbucket.org/2.0/repositories/${WORKSPACE}/${REPO}/pullrequests/${pr_id}/comments" \
+        -H "Content-Type: application/json" --data-binary "$payload" || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        api_cleanup
+        echo -e "${RED}Error:${NC} could not reach Bitbucket" >&2
+        return 1
+    fi
+    if api_status_is_error; then
+        local err="$API_STATUS"
+        cat "$API_BODY_FILE" 2>/dev/null
+        api_cleanup
+        API_STATUS="$err"
+        api_report_error "commenting on pull request #${pr_id}"
+        return 1
+    fi
+
+    local url
+    url="$(jq -r '.links.html.href // ""' < "$API_BODY_FILE" 2>/dev/null)"
+    api_cleanup
+
+    echo ""
+    echo -e "  ${GREEN}✓${NC} Commented on PR #${pr_id}"
+    [[ -n "$url" ]] && echo -e "    ${CYAN}${url}${NC}"
+    echo ""
+}
+
+cmd_pr_help() {
+    cat << 'EOF'
+Usage: bb-cli pr [<number>] [options]
+       bb-cli pr [action] [options]
+
+Commands (mirroring gh):
+  pr [list]                     List pull requests
+  pr view <n> / pr <n>          Show one, with its description
+  pr checks <n>                 Build statuses on its head commit
+  pr edit <n> [--title T] [--body-file F]
+  pr ready <n> [--undo]         Draft -> ready for review, or back
+  pr comment <n> --body-file F  Post a comment
+
+Bodies come from a file on purpose: markdown hard breaks are trailing spaces,
+and command substitution strips them. `--body` exists for one-liners, and `-`
+reads stdin.
+
+Arguments:
+  <number>          Show PR details (e.g., bb-cli pr 123)
+
+Actions:
+  list              List PRs (default: open)
+  open              List open PRs
+  merged            List merged PRs
+  declined          List declined PRs
+
+Options:
+  -b, --branch      Filter by source branch (contains)
+  -t, --target      Filter by target branch (contains)
+  -a, --author      Filter by author name (contains)
+  -s, --state       PR state: OPEN, MERGED, DECLINED
+  -l, --limit       Max results (default: 25)
+  -c, --comments    Show PR comments (with <number>)
+  -j, --json        Output raw JSON
+
+Examples:
+  bb-cli pr                              # Open PRs
+  bb-cli pr 123                         # Show PR #123 details
+  bb-cli pr 123 -c                      # Show PR #123 with comments
+  bb-cli pr merged --limit 10            # Last 10 merged
+  bb-cli pr -b feature                   # PRs from branch containing "feature"
+  bb-cli pr --author alice               # PRs by alice
+EOF
+}
+
+# ============================================================================
+# COMMAND: branch - List branches
+# ============================================================================
+cmd_branch() {
+    local filter=""
+    local limit=25
+    local json_output=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --limit|-l)
+                limit="$2"
+                shift 2
+                ;;
+            --json|-j)
+                json_output=true
+                shift
+                ;;
+            --help|-h)
+                cmd_branch_help
+                return 0
+                ;;
+            *)
+                filter="$1"
+                shift
+                ;;
+        esac
+    done
+
+    get_repo_info
+    check_credentials
+
+    local response
+    response=$(bb_api "repositories/${WORKSPACE}/${REPO}/refs/branches" "pagelen=${limit}&sort=-target.date")
+
+    if [[ "$json_output" == "true" ]]; then
+        echo "$response" | jq '.'
+        return 0
+    fi
+
+    # Filter if specified
+    if [[ -n "$filter" ]]; then
+        response=$(echo "$response" | jq --arg filter "$filter" '
+            .values |= [.[] | select(.name | contains($filter))]
+        ')
+    fi
+
+    echo ""
+    echo -e "${BLUE}Branches${NC} - ${WORKSPACE}/${REPO}"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+
+    echo "$response" | jq -r '
+        .values[] |
+        "  \(.name)",
+        "     Last commit: \(.target.date | split("T")[0]) by \(.target.author.raw | split(" <")[0])",
+        ""
+    '
+}
+
+cmd_branch_help() {
+    cat << 'EOF'
+Usage: bb-cli branch [filter] [options]
+
+Options:
+  -l, --limit       Max results (default: 25)
+  -j, --json        Output raw JSON
+
+Examples:
+  bb-cli branch                    # Recent branches
+  bb-cli branch feature            # Branches containing "feature"
+  bb-cli branch feature            # Branches containing "feature"
+EOF
+}
+
+# ============================================================================
+# COMMAND: repo - Repository info
+# ============================================================================
+cmd_repo() {
+    local json_output=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json|-j)
+                json_output=true
+                shift
+                ;;
+            --help|-h)
+                cmd_repo_help
+                return 0
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    get_repo_info
+    check_credentials
+
+    local response
+    response=$(bb_api "repositories/${WORKSPACE}/${REPO}")
+
+    if [[ "$json_output" == "true" ]]; then
+        echo "$response" | jq '.'
+        return 0
+    fi
+
+    echo ""
+    echo -e "${BLUE}Repository Info${NC}"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    echo "$response" | jq -r '
+        "  Name:        \(.full_name)",
+        "  Description: \(.description // "N/A")",
+        "  Language:    \(.language // "N/A")",
+        "  Main branch: \(.mainbranch.name // "N/A")",
+        "  Private:     \(.is_private)",
+        "  Created:     \(.created_on | split("T")[0])",
+        "  Updated:     \(.updated_on | split("T")[0])",
+        "  URL:         \(.links.html.href)"
+    '
+    echo ""
+}
+
+cmd_repo_help() {
+    cat << 'EOF'
+Usage: bb-cli repo [options]
+
+Options:
+  -j, --json        Output raw JSON
+
+Shows repository information.
+EOF
+}
+
+# ============================================================================
+# MAIN
+# ============================================================================
+# ============================================================================
+# HTTP core - one curl, status code and headers captured
+#
+# Sets API_STATUS (last HTTP status seen) and API_HEADERS_FILE. Prints the
+# response body on stdout. Callers own removing API_HEADERS_FILE.
+#
+# Usage: api_request METHOD URL [extra curl args...]
+# ============================================================================
+API_STATUS=""
+API_HEADERS_FILE=""
+API_BODY_FILE=""
+# Accept header for the next api_request. Empty means send none: the raw log
+# endpoint answers 406 Not Acceptable to `Accept: application/json`, because it
+# returns log text rather than JSON.
+API_ACCEPT="application/json"
+
+# Every mktemp result is registered here so an interrupt or an unexpected exit
+# still cleans up. Without this, ordinary use leaks response bodies and headers
+# into TMPDIR indefinitely.
+BB_TMP_FILES=()
+
+bb_tmp() {
+    local f
+    f="$(mktemp "${TMPDIR:-/tmp}/bb-cli-$1.XXXXXX")" || return 1
+    BB_TMP_FILES+=("$f")
+    printf '%s' "$f"
+}
+
+bb_cleanup_all() {
+    [[ ${#BB_TMP_FILES[@]} -gt 0 ]] && rm -f "${BB_TMP_FILES[@]}" 2>/dev/null
+    BB_TMP_FILES=()
+    return 0
+}
+
+trap bb_cleanup_all EXIT
+trap 'bb_cleanup_all; exit 130' INT TERM
+
+# The response body goes to a file rather than stdout on purpose. A caller
+# writing `body="$(api_request ...)"` would run this in a subshell, and
+# API_STATUS set there would never reach the caller - the status code would be
+# silently lost and every HTTP error would look like a success.
+api_request() {
+    local method="$1"
+    local url="$2"
+    shift 2
+
+    local rc=0
+    API_HEADERS_FILE="$(bb_tmp hdr)"
+    API_BODY_FILE="$(bb_tmp body)"
+
+    local -a curl_args
+    # --proto '=https' makes a file:// or scp:// URL impossible regardless of
+    # where it came from; --proto-redir stops an https->http downgrade putting
+    # basic auth on the wire in the clear.
+    curl_args=(-sS --compressed
+        --proto '=https' --proto-redir '=https' --max-redirs 5
+        -X "$method"
+        -D "$API_HEADERS_FILE"
+        -o "$API_BODY_FILE")
+    [[ -n "$API_ACCEPT" ]] && curl_args+=(-H "Accept: ${API_ACCEPT}")
+
+    # Only follow redirects on reads. -L on a POST would re-post to the target.
+    case "$method" in
+        GET|HEAD) curl_args+=(-L) ;;
+    esac
+
+    bb_curl "${curl_args[@]}" "$@" "$url" || rc=$?
+
+    if [[ $rc -ne 0 ]]; then
+        API_STATUS="000"
+        return $rc
+    fi
+
+    # With -L there are several header blocks; the last status line is the real one.
+    # gsub the CR: header lines end CRLF, and a trailing \r turns every later
+    # numeric comparison on the status into an arithmetic syntax error.
+    # `$0 ~` rather than a field test: awk strips leading whitespace when
+    # splitting, so an indented header continuation line beginning "HTTP/" would
+    # otherwise be read as a status line the server chose.
+    API_STATUS="$(awk '$0 ~ /^HTTP\// { code = $2 } END { gsub(/\r/, "", code); print code }' "$API_HEADERS_FILE" 2>/dev/null)"
+    [[ "$API_STATUS" =~ ^[0-9]{3}$ ]] || API_STATUS="000"
+    return 0
+}
+
+api_cleanup() {
+    [[ -n "$API_HEADERS_FILE" ]] && rm -f "$API_HEADERS_FILE"
+    [[ -n "$API_BODY_FILE" ]] && rm -f "$API_BODY_FILE"
+    API_HEADERS_FILE=""
+    API_BODY_FILE=""
+    return 0
+}
+
+# True when API_STATUS is a real HTTP error. "000" means the status could not be
+# read (no headers captured), which is not by itself a failure.
+api_status_is_error() {
+    # Never let a non-numeric value reach arithmetic context: `[[ x -ge 400 ]]`
+    # evaluates x as an arithmetic expression, and `a[$(cmd)]` runs cmd. This
+    # value comes from a response header, so that would be remote code
+    # execution. API_STATUS is sanitised at the source too; this is the belt.
+    case "$API_STATUS" in
+        '' | *[!0-9]*) return 1 ;;
+    esac
+    [[ "$API_STATUS" != "000" ]] && (( API_STATUS >= 400 ))
+}
+
+api_report_error() {
+    local context="${1:-request}"
+    echo -e "${RED}Error:${NC} ${context} failed with HTTP ${API_STATUS}" >&2
+    if [[ "$API_STATUS" == "403" ]]; then
+        echo -e "  Missing an OAuth scope? ${CYAN}bb-cli docs scopes${NC} lists what each command needs." >&2
+    elif [[ "$API_STATUS" == "401" ]]; then
+        echo -e "  Credentials rejected. Run ${CYAN}bb-cli status${NC}, then ${CYAN}bb-cli login${NC}." >&2
+    fi
+}
+
+# ============================================================================
+# COMMAND: api - authenticated passthrough to the Bitbucket REST API
+#
+# The escape hatch, modelled on `gh api`. Everything the porcelain commands do
+# not cover is one of these, which is what keeps `curl` out of a session.
+# ============================================================================
+
+# Expand :repo / {repo} style placeholders and prefix the API base.
+# Reads API_ENDPOINT_REF for an explicit workspace/repo override.
+api_resolve_url() {
+    local endpoint="$1"
+    local repo_ref="${2:-}"
+
+    # A full URL is accepted, but only for Bitbucket. api_request attaches the
+    # user's credential to whatever it is handed, so without this an endpoint
+    # argument is an exfiltration primitive: one `bb-cli api https://attacker/`
+    # sends the token. That matters more than it sounds, because SKILL.md tells
+    # agents to reach for `bb-cli api`, and an agent reads pull request bodies
+    # and pipeline logs written by other people.
+    if [[ "$endpoint" == http://* ]]; then
+        echo -e "${RED}Error:${NC} refusing plaintext http://" >&2
+        echo "  The credential would go over the wire in the clear." >&2
+        return 1
+    fi
+    if [[ "$endpoint" == https://* ]]; then
+        local host="${endpoint#https://}"
+        host="${host%%/*}"     # strip path
+        host="${host##*@}"     # strip any userinfo
+        host="${host%%:*}"     # strip port
+        case "$host" in
+            api.bitbucket.org | bitbucket.org)
+                # Encode only the path, never the scheme or authority.
+                local after="${endpoint#https://}"
+                local rest="${after#*/}"
+                if [[ "$rest" == "$after" ]]; then
+                    printf '%s' "$endpoint"          # no path at all
+                else
+                    local authority="${after%%/*}"
+                    printf 'https://%s/%s' "$authority" "$(bb_encode_path_braces "$rest")"
+                fi
+                return 0
+                ;;
+        esac
+        echo -e "${RED}Error:${NC} refusing to send Bitbucket credentials to ${host}" >&2
+        echo "  bb-cli only talks to api.bitbucket.org. Use curl if you meant another host." >&2
+        return 1
+    fi
+
+    if [[ "$endpoint" == *:repo* || "$endpoint" == *:workspace* || "$endpoint" == *:slug* || \
+          "$endpoint" == *'{repo}'* || "$endpoint" == *'{workspace}'* || "$endpoint" == *'{slug}'* ]]; then
+        if [[ -n "$repo_ref" ]]; then
+            if ! set_repo_info_from_ref "$repo_ref"; then
+                echo -e "${RED}Error:${NC} Could not parse workspace/repo from: $repo_ref" >&2
+                return 1
+            fi
+        else
+            get_repo_info
+        fi
+        endpoint="${endpoint//\{workspace\}/$WORKSPACE}"
+        endpoint="${endpoint//\{slug\}/$REPO}"
+        endpoint="${endpoint//\{repo\}/$WORKSPACE/$REPO}"
+        endpoint="${endpoint//:workspace/$WORKSPACE}"
+        endpoint="${endpoint//:slug/$REPO}"
+        endpoint="${endpoint//:repo/$WORKSPACE/$REPO}"
+    fi
+
+    endpoint="${endpoint#/}"
+    endpoint="$(bb_encode_path_braces "$endpoint")"
+    case "$endpoint" in
+        2.0/*|internal/*) ;;
+        *) endpoint="2.0/${endpoint}" ;;
+    esac
+
+    printf 'https://api.bitbucket.org/%s' "$endpoint"
+}
+
+# Build a JSON object from the -f (string) and -F (typed) pairs collected by
+# cmd_api. Reads api_raw_keys/api_raw_vals/api_typed_keys/api_typed_vals.
+api_build_body() {
+    local json='{}'
+    local i k v f
+
+    for ((i = 0; i < ${#api_raw_keys[@]}; i++)); do
+        k="${api_raw_keys[$i]}"
+        v="${api_raw_vals[$i]}"
+        json="$(jq -c --arg k "$k" --arg v "$v" '. + {($k): $v}' <<< "$json")"
+    done
+
+    for ((i = 0; i < ${#api_typed_keys[@]}; i++)); do
+        k="${api_typed_keys[$i]}"
+        v="${api_typed_vals[$i]}"
+        if [[ "$v" == @* ]]; then
+            # @file (or @- for stdin) reads the value as a string, like gh
+            f="${v#@}"
+            if [[ "$f" == "-" ]]; then
+                v="$(cat)"
+            elif [[ -f "$f" ]]; then
+                v="$(cat "$f")"
+            else
+                echo -e "${RED}Error:${NC} no such file: $f" >&2
+                return 1
+            fi
+            json="$(jq -c --arg k "$k" --arg v "$v" '. + {($k): $v}' <<< "$json")"
+        elif [[ "$v" == "true" || "$v" == "false" || "$v" == "null" ]] || \
+             [[ "$v" =~ ^-?[0-9]+$ ]] || [[ "$v" =~ ^-?[0-9]*\.[0-9]+$ ]]; then
+            json="$(jq -c --arg k "$k" --argjson v "$v" '. + {($k): $v}' <<< "$json")"
+        else
+            json="$(jq -c --arg k "$k" --arg v "$v" '. + {($k): $v}' <<< "$json")"
+        fi
+    done
+
+    printf '%s' "$json"
+}
+
+cmd_api() {
+    local endpoint=""
+    local method=""
+    local method_set=false
+    local jq_expr=""
+    local include=false
+    local paginate=false
+    local repo_ref=""
+    local input_file=""
+
+    api_raw_keys=(); api_raw_vals=()
+    api_typed_keys=(); api_typed_vals=()
+    local -a extra_headers=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -X|--method)       method="$2"; method_set=true; shift 2 ;;
+            --method=*)        method="${1#*=}"; method_set=true; shift ;;
+            -f|--raw-field)    api_raw_keys+=("${2%%=*}"); api_raw_vals+=("${2#*=}"); shift 2 ;;
+            --raw-field=*)     local rf="${1#*=}"; api_raw_keys+=("${rf%%=*}"); api_raw_vals+=("${rf#*=}"); shift ;;
+            -F|--field)        api_typed_keys+=("${2%%=*}"); api_typed_vals+=("${2#*=}"); shift 2 ;;
+            --field=*)         local tf="${1#*=}"; api_typed_keys+=("${tf%%=*}"); api_typed_vals+=("${tf#*=}"); shift ;;
+            --input)           input_file="$2"; shift 2 ;;
+            --input=*)         input_file="${1#*=}"; shift ;;
+            -q|--jq)           jq_expr="$2"; shift 2 ;;
+            --jq=*)            jq_expr="${1#*=}"; shift ;;
+            -i|--include)      include=true; shift ;;
+            -H|--header)       extra_headers+=("$2"); shift 2 ;;
+            --header=*)        extra_headers+=("${1#*=}"); shift ;;
+            --paginate)        paginate=true; shift ;;
+            -R|--repo|--repository) repo_ref="$2"; shift 2 ;;
+            -R=*|--repo=*|--repository=*) repo_ref="${1#*=}"; shift ;;
+            -h|--help)         cmd_api_help; return 0 ;;
+            --)                shift ;;
+            -*)                echo -e "${RED}Error:${NC} unknown flag for 'api': $1" >&2
+                               echo "Run 'bb-cli api --help' for usage." >&2
+                               return 1 ;;
+            *)                 if [[ -z "$endpoint" ]]; then
+                                   endpoint="$1"
+                               else
+                                   echo -e "${RED}Error:${NC} unexpected argument: $1" >&2
+                                   return 1
+                               fi
+                               shift ;;
+        esac
+    done
+
+    if [[ -z "$endpoint" ]]; then
+        cmd_api_help
+        return 1
+    fi
+
+    # Deliberate deviation from gh: there, -f/-F alone implies POST. On
+    # Bitbucket, POST /pullrequests CREATES a pull request, so the documented
+    # read `api .../pullrequests -f 'q=...'` would silently be destructive.
+    # Here only a body (--input) implies a write; fields never change the
+    # method. Say -X POST when you mean it.
+    if [[ "$method_set" == false ]]; then
+        if [[ -n "$input_file" ]]; then
+            method="POST"
+        else
+            method="GET"
+        fi
+    fi
+    method="$(echo "$method" | tr '[:lower:]' '[:upper:]')"
+
+    local url
+    url="$(api_resolve_url "$endpoint" "$repo_ref")" || return 1
+
+    check_credentials
+
+    # The raw log endpoint returns text and answers 406 Not Acceptable to
+    # `Accept: application/json`. Without this, `bb-cli api .../log` - the single
+    # most likely reason to reach for the escape hatch - could never work.
+    # An explicit -H Accept: from the caller always wins.
+    API_ACCEPT="application/json"
+    local h
+    for h in "${extra_headers[@]}"; do
+        case "$(echo "$h" | tr '[:upper:]' '[:lower:]')" in
+            accept:*) API_ACCEPT="" ;;
+        esac
+    done
+    case "$url" in
+        */log|*/log\?*) API_ACCEPT="" ;;
+    esac
+
+    local -a curl_args=()
+    for h in "${extra_headers[@]}"; do
+        curl_args+=(-H "$h")
+    done
+
+    local body=""
+    if [[ -n "$input_file" ]]; then
+        if [[ "$input_file" == "-" ]]; then
+            body="$(cat)"
+        elif [[ -r "$input_file" && ! -d "$input_file" ]]; then
+            body="$(cat "$input_file")"
+        else
+            echo -e "${RED}Error:${NC} no such file: $input_file" >&2
+            return 1
+        fi
+        curl_args+=(-H "Content-Type: application/json" --data-binary "$body")
+    elif [[ ${#api_raw_keys[@]} -gt 0 || ${#api_typed_keys[@]} -gt 0 ]]; then
+        if [[ "$method" == "GET" || "$method" == "HEAD" ]]; then
+            # Fields on a read become query parameters; curl does the encoding.
+            local i
+            curl_args+=(--get)
+            for ((i = 0; i < ${#api_raw_keys[@]}; i++)); do
+                curl_args+=(--data-urlencode "${api_raw_keys[$i]}=${api_raw_vals[$i]}")
+            done
+            for ((i = 0; i < ${#api_typed_keys[@]}; i++)); do
+                curl_args+=(--data-urlencode "${api_typed_keys[$i]}=${api_typed_vals[$i]}")
+            done
+        else
+            body="$(api_build_body)" || return 1
+            curl_args+=(-H "Content-Type: application/json" --data-binary "$body")
+        fi
+    fi
+
+    local rc=0
+    local out_file=""
+    local failed=false
+
+    if [[ "$paginate" == true ]]; then
+        local pages next_url count=0
+        pages="$(bb_tmp pages)"
+        next_url="$url"
+        while [[ -n "$next_url" ]]; do
+            count=$((count + 1))
+            if [[ $count -gt 100 ]]; then
+                echo -e "${YELLOW}Warning:${NC} stopped after 100 pages" >&2
+                break
+            fi
+            api_request "$method" "$next_url" "${curl_args[@]}" || rc=$?
+            if [[ $rc -ne 0 ]] || api_status_is_error; then
+                rm -f "$pages"
+                out_file="$API_BODY_FILE"
+                failed=true
+                break
+            fi
+            cat "$API_BODY_FILE" >> "$pages"
+            printf '\n' >> "$pages"
+            # `|| true` because set -e would otherwise kill the script here,
+            # with no output and no message, whenever a page is not valid JSON.
+            next_url="$(jq -r '.next // empty' < "$API_BODY_FILE" 2>/dev/null || true)"
+            # The server chooses this value. Accept it only if it is https and
+            # points at the same host we were already talking to; otherwise it
+            # is a cross-host credential leak, a file:// read, or - since the
+            # URL is the last curl argument - curl option injection via "-K".
+            if [[ -n "$next_url" ]]; then
+                case "$next_url" in
+                    https://*)
+                        local next_host="${next_url#https://}"
+                        next_host="${next_host%%/*}"
+                        local this_host="${url#https://}"
+                        this_host="${this_host%%/*}"
+                        if [[ "$next_host" != "$this_host" ]]; then
+                            echo -e "${YELLOW}Warning:${NC} ignoring cross-host 'next' link to ${next_host}" >&2
+                            next_url=""
+                        fi
+                        ;;
+                    *)
+                        echo -e "${YELLOW}Warning:${NC} ignoring non-https 'next' link" >&2
+                        next_url=""
+                        ;;
+                esac
+            fi
+            api_cleanup
+            # Page 1 owns the query string; `next` already carries it.
+            curl_args=()
+            for h in "${extra_headers[@]}"; do curl_args+=(-H "$h"); done
+        done
+        if [[ "$failed" != true ]]; then
+            out_file="$(bb_tmp merged)"
+            if ! jq -s '{values: (map(.values // []) | add // [])}' "$pages" > "$out_file" 2>/dev/null; then
+                cp "$pages" "$out_file"
+            fi
+            rm -f "$pages"
+        fi
+    else
+        api_request "$method" "$url" "${curl_args[@]}" || rc=$?
+        out_file="$API_BODY_FILE"
+    fi
+
+    if [[ "$include" == true && -n "$API_HEADERS_FILE" && -f "$API_HEADERS_FILE" ]]; then
+        cat "$API_HEADERS_FILE"
+    fi
+
+    if [[ -n "$out_file" && -f "$out_file" ]]; then
+        if [[ -n "$jq_expr" ]]; then
+            jq -r "$jq_expr" < "$out_file"
+        elif jq -e . < "$out_file" > /dev/null 2>&1; then
+            jq . < "$out_file"
+        else
+            cat "$out_file"
+        fi
+        [[ "$out_file" != "$API_BODY_FILE" ]] && rm -f "$out_file"
+    fi
+
+    local status="$API_STATUS"
+    api_cleanup
+
+    if [[ $rc -ne 0 ]]; then
+        echo -e "${RED}Error:${NC} request to ${url} failed" >&2
+        return 1
+    fi
+    API_STATUS="$status"
+    if api_status_is_error; then
+        api_report_error "${method} ${url}"
+        return 1
+    fi
+    return 0
+}
+
+cmd_api_help() {
+    cat << 'EOF'
+Usage: bb-cli api <endpoint> [flags]
+
+Authenticated passthrough to the Bitbucket REST API - the `gh api` of bb-cli.
+Anything the porcelain commands do not cover is one of these.
+
+Endpoint:
+  repositories/:repo/pullrequests/10  path under https://api.bitbucket.org/2.0/
+  2.0/user                            an explicit 2.0/ prefix is kept as-is
+  internal/repositories/:repo/...     the undocumented internal API
+  https://api.bitbucket.org/...       a full URL, but only on api.bitbucket.org
+                                      or bitbucket.org, and only over https:
+                                      this command attaches your credential to
+                                      whatever it is given
+
+Placeholders, expanded from the git remote (or from --repo):
+  :repo / {repo}            workspace/repo-slug
+  :workspace / {workspace}  the workspace alone
+  :slug / {slug}            the repo slug alone
+
+Flags:
+  -X, --method METHOD   HTTP method. Default GET, or POST when --input is given.
+                        Unlike `gh api`, -f/-F alone does NOT imply POST: on
+                        Bitbucket a POST to /pullrequests creates a pull
+                        request, so an accidental write is expensive. Say
+                        -X POST when you mean it.
+  -f, --raw-field K=V   string field; a query parameter on GET, a JSON field
+                        on any write method
+  -F, --field K=V       typed field: true/false/null and numbers stay unquoted,
+                        @file reads the value from a file
+      --input FILE      request body read verbatim from FILE ("-" for stdin).
+                        Use this for anything multi-line: it preserves bytes,
+                        which shell quoting does not
+  -q, --jq EXPR         filter the response through jq
+  -i, --include         print response headers (x-oauth-scopes lives here)
+  -H, --header "K: V"   extra request header (repeatable)
+      --paginate        follow `next` links and merge every page's .values
+  -R, --repo REF        workspace/repo or Bitbucket URL, instead of the remote
+  -h, --help            this help
+
+Exit code is 1 on any HTTP status >= 400; the response body is still printed.
+
+Examples:
+  # read one field out of a pull request
+  bb-cli api repositories/:repo/pullrequests/42 -q .description
+
+  # rewrite a PR body without shell quoting eating it
+  bb-cli api repositories/:repo/pullrequests/42 -X PUT --input body.json
+
+  # what can this token actually do?
+  bb-cli api repositories/:repo -i | grep -i oauth
+
+  # every PR into a branch, across pages
+  bb-cli api repositories/:repo/pullrequests --paginate \
+    -f 'q=destination.branch.name="master"' -q '.values[].title'
+
+  # build statuses on a commit
+  bb-cli api repositories/:repo/commit/$(git rev-parse HEAD)/statuses -q '.values[].key'
+
+  # pipeline caches (no porcelain command yet)
+  bb-cli api repositories/:repo/pipelines-config/caches -q '.values[].name'
+  bb-cli api repositories/:repo/pipelines-config/caches/<uuid> -X DELETE
+
+  # cancel a running pipeline
+  bb-cli api repositories/:repo/pipelines/<uuid>/stopPipeline -X POST
+EOF
+}
+
+# ============================================================================
+# COMMAND: signoff - publish a build status from a local run
+#
+# The Bitbucket counterpart of basecamp/gh-signoff. Publishing needs only
+# read:repository:bitbucket - measured, not assumed. Requiring the status for
+# merge is a separate, admin-only capability and is deliberately not here.
+# ============================================================================
+
+signoff_default_description() {
+    local who
+    who="$(git config user.name 2>/dev/null || true)"
+    [[ -n "$who" ]] || who="${BITBUCKET_USERNAME%%@*}"
+    [[ -n "$who" ]] || who="someone"
+    printf '%s signed off after a local run on %s %s' "$who" "$(uname -s)" "$(uname -m)"
+}
+
+cmd_signoff() {
+    local action="publish"
+    local state="SUCCESSFUL"
+    local key="local-signoff"
+    local name=""
+    local description=""
+    local url=""
+    local rev="HEAD"
+    local rev_given=false
+    local repo_ref=""
+    local force=false
+    local dry_run=false
+    local json_output=false
+
+    case "${1:-}" in
+        status|list|ls) action="status"; shift ;;
+    esac
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -s|--state)        state="$2"; shift 2 ;;
+            --state=*)         state="${1#*=}"; shift ;;
+            -k|--key)          key="$2"; shift 2 ;;
+            --key=*)           key="${1#*=}"; shift ;;
+            -n|--name)         name="$2"; shift 2 ;;
+            --name=*)          name="${1#*=}"; shift ;;
+            -d|--description)  description="$2"; shift 2 ;;
+            --description=*)   description="${1#*=}"; shift ;;
+            -u|--url)          url="$2"; shift 2 ;;
+            --url=*)           url="${1#*=}"; shift ;;
+            -c|--commit)       rev="$2"; rev_given=true; shift 2 ;;
+            --commit=*)        rev="${1#*=}"; rev_given=true; shift ;;
+            -R|--repo|--repository) repo_ref="$2"; shift 2 ;;
+            -R=*|--repo=*|--repository=*) repo_ref="${1#*=}"; shift ;;
+            --fail|--failed)   state="FAILED"; shift ;;
+            --in-progress)     state="INPROGRESS"; shift ;;
+            -f|--force)        force=true; shift ;;
+            --dry-run)         dry_run=true; shift ;;
+            -j|--json)         json_output=true; shift ;;
+            -h|--help)         cmd_signoff_help; return 0 ;;
+            *)                 echo -e "${RED}Error:${NC} unexpected argument: $1" >&2
+                               echo "Run 'bb-cli signoff --help' for usage." >&2
+                               return 1 ;;
+        esac
+    done
+
+    if [[ -n "$repo_ref" ]]; then
+        if ! set_repo_info_from_ref "$repo_ref"; then
+            echo -e "${RED}Error:${NC} Could not parse workspace/repo from: $repo_ref" >&2
+            return 1
+        fi
+        if [[ "$rev_given" == false ]]; then
+            echo -e "${RED}Error:${NC} --repo needs an explicit --commit <sha>" >&2
+            echo "  Without it, HEAD would be resolved in the checkout you are standing in," >&2
+            echo "  which is a different repository from the one you named." >&2
+            return 1
+        fi
+    else
+        get_repo_info
+    fi
+    check_credentials
+
+    # Resolve the revision. A full sha we have no object for is still usable:
+    # it may name a commit this clone has not fetched.
+    local sha in_git=false
+    if git rev-parse --git-dir > /dev/null 2>&1; then
+        in_git=true
+    fi
+    sha="$(git rev-parse --verify --quiet "${rev}^{commit}" 2>/dev/null || true)"
+    if [[ -z "$sha" ]]; then
+        if [[ "$rev" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            sha="$rev"
+            in_git=false
+        else
+            echo -e "${RED}Error:${NC} not a commit: $rev" >&2
+            return 1
+        fi
+    fi
+
+    if [[ "$action" == "status" ]]; then
+        cmd_signoff_status "$sha" "$json_output"
+        return $?
+    fi
+
+    state="$(echo "$state" | tr '[:lower:]' '[:upper:]')"
+    case "$state" in
+        SUCCESSFUL|FAILED|INPROGRESS|STOPPED) ;;
+        *)
+            echo -e "${RED}Error:${NC} --state must be one of SUCCESSFUL, FAILED, INPROGRESS, STOPPED" >&2
+            return 1
+            ;;
+    esac
+
+    # Two guards, both overridable with --force. A signoff is a claim that a
+    # suite ran green against exactly this commit; a dirty tree means it did
+    # not, and an unpushed commit does not exist for the API to attach to.
+    if [[ "$force" != true && "$in_git" == true ]]; then
+        if [[ -n "$(git status --porcelain 2>/dev/null)" ]]; then
+            echo -e "${RED}Error:${NC} working tree is not clean" >&2
+            echo "  A signoff attests a run against this exact commit. Commit or stash first," >&2
+            echo "  or pass --force if you know the difference does not matter." >&2
+            return 1
+        fi
+        if [[ -z "$(git branch -r --contains "$sha" 2>/dev/null)" ]]; then
+            echo -e "${RED}Error:${NC} commit ${sha:0:9} is not on any remote branch" >&2
+            echo "  Push it first, or pass --force. Bitbucket has no such commit to attach to yet." >&2
+            return 1
+        fi
+    fi
+
+    [[ -n "$url" ]] || url="https://bitbucket.org/${WORKSPACE}/${REPO}/commits/${sha}"
+    [[ -n "$name" ]] || name="local signoff"
+    [[ -n "$description" ]] || description="$(signoff_default_description)"
+
+    local body
+    body="$(jq -nc \
+        --arg key "$key" \
+        --arg state "$state" \
+        --arg name "$name" \
+        --arg url "$url" \
+        --arg description "$description" \
+        '{key: $key, state: $state, name: $name, url: $url, description: $description}')"
+
+    local endpoint="repositories/${WORKSPACE}/${REPO}/commit/${sha}/statuses/build"
+
+    if [[ "$dry_run" == true ]]; then
+        echo "POST https://api.bitbucket.org/2.0/${endpoint}"
+        printf '%s' "$body" | jq .
+        return 0
+    fi
+
+    local rc=0
+    api_request POST "https://api.bitbucket.org/2.0/${endpoint}" \
+        -H "Content-Type: application/json" --data-binary "$body" || rc=$?
+
+    if [[ $rc -ne 0 ]]; then
+        api_cleanup
+        echo -e "${RED}Error:${NC} could not reach Bitbucket" >&2
+        return 1
+    fi
+    if api_status_is_error; then
+        jq . < "$API_BODY_FILE" 2>/dev/null || cat "$API_BODY_FILE"
+        local err_status="$API_STATUS"
+        api_cleanup
+        API_STATUS="$err_status"
+        api_report_error "publishing build status"
+        return 1
+    fi
+
+    if [[ "$json_output" == true ]]; then
+        jq . < "$API_BODY_FILE"
+        api_cleanup
+        return 0
+    fi
+    api_cleanup
+
+    local marker="${GREEN}✓${NC}"
+    [[ "$state" == "SUCCESSFUL" ]] || marker="${YELLOW}•${NC}"
+    echo ""
+    echo -e "  ${marker} ${key}  ${state}  ${sha:0:9}"
+    echo -e "    ${name}"
+    echo -e "    ${CYAN}${url}${NC}"
+    echo ""
+    echo -e "  Verify: ${CYAN}bb-cli signoff status${NC}"
+    echo ""
+}
+
+cmd_signoff_status() {
+    local sha="$1"
+    local json_output="${2:-false}"
+
+    local rc=0
+    api_request GET \
+        "https://api.bitbucket.org/2.0/repositories/${WORKSPACE}/${REPO}/commit/${sha}/statuses?pagelen=100" || rc=$?
+
+    if [[ $rc -ne 0 ]]; then
+        api_cleanup
+        echo -e "${RED}Error:${NC} could not reach Bitbucket" >&2
+        return 1
+    fi
+    if api_status_is_error; then
+        local err_status="$API_STATUS"
+        api_cleanup
+        API_STATUS="$err_status"
+        api_report_error "reading build statuses"
+        return 1
+    fi
+
+    local response
+    response="$(cat "$API_BODY_FILE")"
+    api_cleanup
+
+    if [[ "$json_output" == true ]]; then
+        printf '%s' "$response" | jq .
+        return 0
+    fi
+
+    local count
+    count="$(printf '%s' "$response" | jq -r '.values | length' 2>/dev/null || echo 0)"
+
+    echo ""
+    echo -e "${BLUE}Build statuses${NC} on ${sha:0:9}  (${WORKSPACE}/${REPO})"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+
+    if [[ "$count" == "0" ]]; then
+        echo "  No build statuses on this commit."
+        echo ""
+        echo -e "  Publish one with ${CYAN}bb-cli signoff${NC}."
+        echo ""
+        return 0
+    fi
+
+    printf '%s' "$response" \
+        | jq -r '.values[] | [.key, .state, (.name // ""), ((.updated_on // "") | split("T")[0])] | @tsv' \
+        | awk -F'\t' '{ printf "  %-22s %-12s %-40s %s\n", $1, $2, substr($3, 1, 40), $4 }'
+    echo ""
+}
+
+cmd_signoff_help() {
+    cat << 'EOF'
+Usage: bb-cli signoff [flags]
+       bb-cli signoff status [flags]
+
+Publish a build status on a commit from the result of a local run - the
+Bitbucket counterpart of `gh signoff`. The pull request then shows a check
+without a pipeline having run.
+
+Publishing needs only read:repository:bitbucket. Measured, not assumed:
+see `bb-cli docs signoff`.
+
+Flags:
+  -s, --state STATE      SUCCESSFUL (default), FAILED, INPROGRESS, STOPPED
+      --fail             shorthand for --state FAILED
+      --in-progress      shorthand for --state INPROGRESS
+  -k, --key KEY          status identity, default "local-signoff". A later run
+                         with the same key overwrites this status, so keep it
+                         stable and predictable rather than generated
+  -n, --name NAME        free label, e.g. "vitest 461 passed, 23 skipped, 8s".
+                         This is the part a reviewer reads weeks later
+  -d, --description TEXT longer text, defaults to who signed off and on what OS
+  -u, --url URL          defaults to the commit page; there is no build page
+  -c, --commit REV       any revision, default HEAD
+  -R, --repo REF         workspace/repo; requires an explicit --commit
+  -f, --force            skip the clean-tree and pushed-commit guards
+      --dry-run          print the request instead of sending it
+  -j, --json             raw JSON response
+  -h, --help             this help
+
+Two guards, because a signoff is a claim:
+  - the working tree must be clean, or the run did not test this commit
+  - the commit must be on a remote, or Bitbucket has nothing to attach to
+
+Examples:
+  npm test && bb-cli signoff --name "vitest $(date +%H:%M)"
+  bb-cli signoff --key lint --name "eslint clean"
+  bb-cli signoff --fail --name "3 failures in checkout_spec"
+  bb-cli signoff status
+  bb-cli signoff status --commit HEAD~1
+
+Not implemented on purpose: `signoff install`, the counterpart of
+`gh signoff install`. Requiring a status for merge is a Bitbucket branch
+restriction, which needs admin:repository:bitbucket to read as well as write,
+and it changes a merge policy every other contributor lives under. Ask whoever
+administers the repository to add it once.
+EOF
+}
+
+# ============================================================================
+# COMMAND: docs / man / skill - discoverability for humans and for agents
+# ============================================================================
+BB_CLI_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+# docs, man and skill read files that sit beside the script. A single-file
+# install has none of them, which is a legitimate way to run bb-cli rather than
+# a broken one, so say what is missing and what gets it back.
+bb_no_bundle() {
+    echo -e "${RED}Error:${NC} $1 not found at $2" >&2
+    echo "" >&2
+    echo "  This is a single-file install: bb-cli was copied onto your PATH" >&2
+    echo "  without the repository beside it. Every command still works; the" >&2
+    echo "  bundled documentation and the agent skill do not ship in the script." >&2
+    echo "" >&2
+    echo "  To get them (and upgrades over git):" >&2
+    echo "" >&2
+    echo -e "    ${CYAN}curl -fsSL https://raw.githubusercontent.com/jonasporto/bb-cli/main/install.sh | bash${NC}" >&2
+    echo "" >&2
+    echo "  Or read them at https://github.com/jonasporto/bb-cli" >&2
+    return 1
+}
+
+cmd_docs() {
+    local topic="${1:-}"
+    local docs_dir="${BB_CLI_ROOT}/docs"
+
+    if [[ ! -d "$docs_dir" ]]; then
+        bb_no_bundle "docs" "$docs_dir"
+        return 1
+    fi
+
+    if [[ -z "$topic" ]]; then
+        echo ""
+        echo -e "${BLUE}bb-cli docs${NC}  (${docs_dir})"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo ""
+        local f base title
+        for f in "$docs_dir"/*.md; do
+            [[ -f "$f" ]] || continue
+            base="$(basename "$f" .md)"
+            title="$(grep -m1 '^# ' "$f" 2>/dev/null | sed 's/^# //')"
+            printf "  %-14s %s\n" "$base" "$title"
+        done
+        echo ""
+        echo -e "  Read one with ${CYAN}bb-cli docs <topic>${NC}, or ${CYAN}man bb-cli${NC}."
+        echo ""
+        return 0
+    fi
+
+    # A topic is a bare name. Without this, `bb-cli docs ../../../../etc/x`
+    # reads any .md on the machine - and `docs` looks harmless enough that an
+    # agent would run it without a second thought.
+    case "$topic" in
+        */* | .*)
+            echo -e "${RED}Error:${NC} invalid doc name: ${topic}" >&2
+            return 1
+            ;;
+    esac
+
+    local file="${docs_dir}/${topic}.md"
+    if [[ ! -f "$file" ]]; then
+        echo -e "${RED}Error:${NC} no doc named '${topic}'" >&2
+        cmd_docs >&2
+        return 1
+    fi
+    cat "$file"
+}
+
+cmd_man() {
+    local page="${BB_CLI_ROOT}/man/bb-cli.1"
+    if [[ ! -f "$page" ]]; then
+        bb_no_bundle "man page" "$page"
+        return 1
+    fi
+    if command -v man > /dev/null 2>&1; then
+        man "$page"
+        return $?
+    fi
+
+    # No man(1), which is normal in a slim container. `cat` on the page dumps
+    # roff source at the reader (".TH BB\-CLI 1 ..."), which is worse than
+    # useless. groff renders it; otherwise send them to the same content in a
+    # form that needs no renderer.
+    if command -v groff > /dev/null 2>&1; then
+        groff -Tascii -man "$page" 2> /dev/null | col -b 2> /dev/null || groff -Tascii -man "$page"
+        return $?
+    fi
+    if command -v nroff > /dev/null 2>&1; then
+        nroff -man "$page" 2> /dev/null | col -b 2> /dev/null || nroff -man "$page"
+        return $?
+    fi
+
+    echo -e "${YELLOW}!${NC} No man(1) or groff on this machine, so the page cannot be rendered." >&2
+    echo "" >&2
+    echo "  The same material, as plain text:" >&2
+    echo "" >&2
+    echo -e "    ${CYAN}bb-cli docs${NC}         the five topics" >&2
+    echo -e "    ${CYAN}bb-cli --help${NC}       the command surface" >&2
+    echo "" >&2
+    echo -e "  The unrendered page is at ${page}" >&2
+    return 1
+}
+
+cmd_skill() {
+    local action="${1:-help}"
+    shift || true
+
+    local src="${BB_CLI_ROOT}/skills/bb-cli"
+
+    case "$action" in
+        print|cat|show)
+            if [[ ! -f "${src}/SKILL.md" ]]; then
+                bb_no_bundle "skill" "${src}/SKILL.md"
+                return 1
+            fi
+            cat "${src}/SKILL.md"
+            ;;
+        path)
+            echo "${src}/SKILL.md"
+            ;;
+        install)
+            local dest="" force=false copy=false
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --dir)      dest="$2"; shift 2 ;;
+                    --dir=*)    dest="${1#*=}"; shift ;;
+                    --project)  dest="$(pwd)/.claude/skills"; shift ;;
+                    --copy)     copy=true; shift ;;
+                    --force)    force=true; shift ;;
+                    -h|--help)  cmd_skill_help; return 0 ;;
+                    *)          echo -e "${RED}Error:${NC} unexpected argument: $1" >&2; return 1 ;;
+                esac
+            done
+
+            if [[ ! -f "${src}/SKILL.md" ]]; then
+                bb_no_bundle "skill" "${src}/SKILL.md"
+                return 1
+            fi
+
+            [[ -n "$dest" ]] || dest="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills"
+            local target="${dest}/bb-cli"
+
+            if [[ -e "$target" || -L "$target" ]] && [[ "$force" != true ]]; then
+                echo -e "${YELLOW}Already installed:${NC} ${target}" >&2
+                echo "  Pass --force to overwrite." >&2
+                return 1
+            fi
+
+            mkdir -p "$dest"
+            rm -rf "$target"
+
+            # Symlink by default, the same way install.sh treats the binary and
+            # the man page. A copy goes stale the moment the repository moves
+            # on, and nothing would tell you: this command has no update
+            # command to run, unlike `npx skills`. A link means `git pull`
+            # updates the skill too. Claude Code follows symlinked skill
+            # directories - `npx skills` relies on exactly that.
+            if [[ "$copy" == true ]]; then
+                cp -R "$src" "$target"
+            else
+                ln -s "$src" "$target"
+            fi
+
+            echo ""
+            if [[ "$copy" == true ]]; then
+                echo -e "  ${GREEN}✓${NC} bb-cli skill copied to ${CYAN}${target}${NC}"
+                echo -e "    ${YELLOW}A copy does not track this repository.${NC} Re-run with --force"
+                echo "    after a git pull, or drop --copy to link it instead."
+            else
+                echo -e "  ${GREEN}✓${NC} bb-cli skill linked at ${CYAN}${target}${NC}"
+                echo -e "    -> ${src}"
+                echo "    A git pull in this repository updates the skill too."
+            fi
+            echo ""
+            echo "  Claude Code picks it up on the next session. Ask it to"
+            echo "  \"use bb-cli to list open PRs\" and it will know how."
+            echo ""
+            echo -e "  For any other agent, or to install without this checkout:"
+            echo -e "    ${CYAN}npx skills add jonasporto/bb-cli${NC}"
+            echo ""
+            ;;
+        help|-h|--help)
+            cmd_skill_help
+            ;;
+        *)
+            echo -e "${RED}Error:${NC} unknown skill action: $action" >&2
+            cmd_skill_help >&2
+            return 1
+            ;;
+    esac
+}
+
+cmd_skill_help() {
+    cat << 'EOF'
+Usage: bb-cli skill <action>
+
+Install the bundled skill, so an agent on a machine that has never seen bb-cli
+knows what it is and how to use it.
+
+Actions:
+  install [--dir DIR] [--project] [--copy] [--force]
+        Link the skill into a skills directory. Default is
+        $CLAUDE_CONFIG_DIR/skills (or ~/.claude/skills), which makes it
+        available in every project. --project installs into ./.claude/skills
+        instead, which commits with the repository. --copy takes a detached
+        copy rather than a link.
+  print
+        Write SKILL.md to stdout. Useful for piping into another agent's
+        context without installing anything.
+  path
+        Print the path to the bundled SKILL.md.
+
+This is the small, dependency-free option. It is NOT equivalent to
+`npx skills add jonasporto/bb-cli`, which is a real package manager for agent
+skills. That one:
+
+  - installs for around eighty agents, not just Claude Code
+  - works without this checkout, cloning the repository itself
+  - writes a skills-lock.json with a content hash
+  - has update, list and remove; this command has none of them
+
+Use this one when you already have the repository and would rather not involve
+node, or when you are offline. Use npx for anything else.
+
+Other ways to reach the same material:
+  bb-cli docs         the full documentation set, in the repository
+  man bb-cli          the man page, after install.sh
+  AGENTS.md           at the repository root, for agents that read it
+EOF
+}
+
+# ============================================================================
+# COMMAND: cache - pipeline caches (the `gh cache` of bb-cli)
+# ============================================================================
+cmd_cache() {
+    local action="list"
+    local target=""
+    local repo_ref=""
+    local json_output=false
+    local yes=false
+
+    case "${1:-}" in
+        list | ls) action="list"; shift ;;
+        delete | rm) action="delete"; shift ;;
+        -h | --help) cmd_cache_help; return 0 ;;
+    esac
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -R | --repo | --repository) repo_ref="$2"; shift 2 ;;
+            -R=* | --repo=* | --repository=*) repo_ref="${1#*=}"; shift ;;
+            -j | --json) json_output=true; shift ;;
+            -y | --yes) yes=true; shift ;;
+            -h | --help) cmd_cache_help; return 0 ;;
+            *) target="$1"; shift ;;
+        esac
+    done
+
+    if [[ -n "$repo_ref" ]]; then
+        set_repo_info_from_ref "$repo_ref" || {
+            echo -e "${RED}Error:${NC} Could not parse workspace/repo from: $repo_ref" >&2
+            return 1
+        }
+    else
+        get_repo_info
+    fi
+    check_credentials
+
+    local base="https://api.bitbucket.org/2.0/repositories/${WORKSPACE}/${REPO}/pipelines-config/caches"
+    local rc=0
+
+    if [[ "$action" == "delete" ]]; then
+        if [[ -z "$target" ]]; then
+            echo -e "${RED}Error:${NC} which cache? Pass a uuid from 'bb-cli cache list'." >&2
+            return 1
+        fi
+        # By uuid only, on purpose. Bitbucket also accepts ?name=, and that
+        # deletes EVERY cache sharing the name - caches are distinguished by
+        # path as well - so one call wipes other branches' caches too.
+        if [[ "$target" != \{* && ! "$target" =~ ^[0-9a-fA-F-]{36}$ ]]; then
+            echo -e "${RED}Error:${NC} '${target}' is not a uuid" >&2
+            echo "  Deleting by name would remove every cache sharing that name, on" >&2
+            echo "  every branch. Take the uuid from 'bb-cli cache list' instead." >&2
+            return 1
+        fi
+
+        if [[ "$yes" != true && -t 0 ]]; then
+            echo ""
+            echo -e "  Delete cache ${CYAN}${target}${NC} from ${WORKSPACE}/${REPO}?"
+            read -r -p "  Type 'y' to confirm: " confirm
+            [[ "$confirm" == "y" ]] || { echo "  Cancelled."; echo ""; return 1; }
+        fi
+
+        api_request DELETE "${base}/$(encode_bb_uuid "$target")" || rc=$?
+        if [[ $rc -ne 0 ]]; then
+            api_cleanup
+            echo -e "${RED}Error:${NC} could not reach Bitbucket" >&2
+            return 1
+        fi
+        if api_status_is_error; then
+            local err="$API_STATUS"
+            cat "$API_BODY_FILE" 2>/dev/null
+            api_cleanup
+            API_STATUS="$err"
+            api_report_error "deleting cache"
+            return 1
+        fi
+        api_cleanup
+        echo ""
+        echo -e "  ${GREEN}✓${NC} Deleted ${target}"
+        echo ""
+        return 0
+    fi
+
+    api_request GET "${base}?pagelen=100" || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        api_cleanup
+        echo -e "${RED}Error:${NC} could not reach Bitbucket" >&2
+        return 1
+    fi
+    if api_status_is_error; then
+        local err="$API_STATUS"
+        api_cleanup
+        API_STATUS="$err"
+        api_report_error "listing caches"
+        return 1
+    fi
+
+    local response
+    response="$(cat "$API_BODY_FILE")"
+    api_cleanup
+
+    if [[ "$json_output" == true ]]; then
+        printf '%s' "$response" | jq .
+        return 0
+    fi
+
+    local count
+    count="$(printf '%s' "$response" | jq -r '.values | length' 2>/dev/null || echo 0)"
+
+    echo ""
+    echo -e "${BLUE}Pipeline caches${NC}  (${WORKSPACE}/${REPO})"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+
+    if [[ "$count" == "0" ]]; then
+        echo "  No caches."
+        echo ""
+        return 0
+    fi
+
+    printf '%s' "$response" \
+        | jq -r '.values[] | [.uuid, .name, ((.file_size_bytes // 0) / 1048576 | floor | tostring + " MB"), ((.created_on // "") | split("T")[0])] | @tsv' \
+        | awk -F'\t' '{ printf "  %-40s %-18s %10s  %s\n", $1, $2, $3, $4 }'
+    echo ""
+    echo -e "  Delete one with ${CYAN}bb-cli cache delete <uuid>${NC}"
+    echo ""
+}
+
+cmd_cache_help() {
+    cat << 'EOF'
+Usage: bb-cli cache [list|delete <uuid>] [flags]
+
+Pipeline caches - the `gh cache` of bb-cli.
+
+Commands:
+  list                 every cache, with uuid, name, size and age (default)
+  delete <uuid>        remove one cache
+
+Flags:
+  -R, --repo REF       workspace/repo or a Bitbucket URL
+  -j, --json           raw JSON
+  -y, --yes            skip the confirmation prompt
+  -h, --help           this help
+
+Deletion is by uuid only, deliberately. Bitbucket's API also accepts
+`?name=<name>`, and that removes EVERY cache sharing that name - caches are
+distinguished by path as well as by name, so one call takes out other branches'
+caches too. If you really want that, it is one `bb-cli api ... -X DELETE`.
+EOF
+}
+
+# ============================================================================
+# Update check and upgrade
+#
+# A releases-API check was the obvious design and was rejected: it answers 404
+# for a private repository, so the notice would silently never fire for anyone
+# using bb-cli on one. Measured, not assumed.
+#
+# bb-cli is installed as a git checkout with a symlink onto PATH, so git is the
+# honest source: fetch in the background, compare HEAD against the upstream
+# branch. That works private or public, needs no tags and no releases API, and
+# reuses the credentials the clone already has.
+# ============================================================================
+UPDATE_CACHE="${CONFIG_DIR}/update-check"
+UPDATE_ATTEMPT="${CONFIG_DIR}/update-attempt"
+UPDATE_NOTIFIED="${CONFIG_DIR}/update-notified"
+UPDATE_TTL=18000        # 5 hours between fetches
+UPDATE_NOTICE_TTL=86400 # once a day at most
+
+bb_root_is_git() {
+    # --show-toplevel and an equality test, not --is-inside-work-tree: that one
+    # walks up, so a bb-cli copied inside an unrelated checkout would report
+    # true and `upgrade` would git-pull the user's own project instead.
+    local top
+    top="$(git -C "$BB_CLI_ROOT" rev-parse --show-toplevel 2>/dev/null)" || return 1
+    [[ -n "$top" && "$top" == "$BB_CLI_ROOT" ]]
+}
+
+# A branch name beginning with "-" would be read by git as an option.
+bb_branch_is_safe() {
+    [[ "$1" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ ]]
+}
+
+# Read a unix timestamp from a file, defaulting to 0 on anything unexpected.
+bb_read_stamp() {
+    local file="$1" value=0
+    [[ -f "$file" ]] && value=$(head -1 "$file" 2>/dev/null || echo 0)
+    case "$value" in
+        '' | *[!0-9]*) value=0 ;;
+    esac
+    printf '%s' "$value"
+}
+
+# Refresh the cache. Run detached, never inline: a fetch can take seconds and no
+# command should pay for it. Hidden subcommand, spawned by bb_spawn_update_refresh.
+cmd_refresh_update_cache() {
+    bb_root_is_git || return 0
+
+    local branch upstream behind
+    branch=$(git -C "$BB_CLI_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null) || return 0
+    [[ -n "$branch" && "$branch" != "HEAD" ]] || return 0
+    bb_branch_is_safe "$branch" || return 0
+
+    # Report a failed fetch, so `upgrade` can say "could not reach origin"
+    # rather than the reassuring lie "already up to date".
+    git -C "$BB_CLI_ROOT" fetch --quiet origin "$branch" 2>/dev/null || return 1
+
+    upstream="origin/${branch}"
+    git -C "$BB_CLI_ROOT" rev-parse --verify --quiet "$upstream" > /dev/null 2>&1 || return 0
+    behind=$(git -C "$BB_CLI_ROOT" rev-list --count "HEAD..${upstream}" 2>/dev/null || echo 0)
+    case "$behind" in
+        '' | *[!0-9]*) behind=0 ;;
+    esac
+
+    mkdir -p "$CONFIG_DIR" 2>/dev/null || true
+    printf '%s\n%s\n%s\n' "$(date +%s)" "$behind" "$branch" > "$UPDATE_CACHE" 2>/dev/null || true
+    return 0
+}
+
+bb_spawn_update_refresh() {
+    local now last
+    now=$(date +%s)
+    last=$(bb_read_stamp "$UPDATE_ATTEMPT")
+    [[ $((now - last)) -lt "$UPDATE_TTL" ]] && return 0
+
+    mkdir -p "$CONFIG_DIR" 2>/dev/null || true
+    printf '%s\n' "$now" > "$UPDATE_ATTEMPT" 2>/dev/null || true
+
+    # Detached, output discarded, failure ignored. Nothing about this may reach
+    # the caller's stdout, stderr or exit code.
+    ( GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/usr/bin/true SSH_ASKPASS=/usr/bin/true \
+        "${BB_CLI_ROOT}/bin/bb-cli" _refresh-update-cache \
+        < /dev/null > /dev/null 2>&1 & ) > /dev/null 2>&1 || true
+    return 0
+}
+
+# The notice text, from the cache only. Never touches the network.
+bb_update_notice_text() {
+    [[ -f "$UPDATE_CACHE" ]] || return 0
+    local behind branch
+    behind=$(sed -n '2p' "$UPDATE_CACHE" 2>/dev/null)
+    branch=$(sed -n '3p' "$UPDATE_CACHE" 2>/dev/null)
+    case "$behind" in
+        '' | *[!0-9]* | 0) return 0 ;;
+    esac
+    local plural="s"
+    [[ "$behind" == "1" ]] && plural=""
+    printf 'bb-cli is %s commit%s behind origin/%s. Run: bb-cli upgrade' \
+        "$behind" "$plural" "${branch:-main}"
+    return 0
+}
+
+# Print the notice at most once a day, on stderr, and only for a human at a
+# terminal. `bb-cli api ... -q .description` gets piped into scripts and jq;
+# a line those did not ask for would corrupt them. An agent capturing output
+# is not a terminal either, so it never sees this.
+# Opt out entirely with BB_CLI_NO_UPDATE_CHECK=1.
+bb_maybe_notify_update() {
+    [[ "${BB_CLI_NO_UPDATE_CHECK:-0}" == "1" ]] && return 0
+    [[ -t 2 ]] || return 0
+    bb_root_is_git || return 0
+
+    local now cached_at
+    now=$(date +%s)
+    cached_at=$(bb_read_stamp "$UPDATE_CACHE")
+    [[ $((now - cached_at)) -lt "$UPDATE_TTL" ]] || bb_spawn_update_refresh
+
+    local notice
+    notice=$(bb_update_notice_text)
+    [[ -n "$notice" ]] || return 0
+
+    local last
+    last=$(bb_read_stamp "$UPDATE_NOTIFIED")
+    [[ $((now - last)) -lt "$UPDATE_NOTICE_TTL" ]] && return 0
+
+    mkdir -p "$CONFIG_DIR" 2>/dev/null || true
+    printf '%s\n' "$now" > "$UPDATE_NOTIFIED" 2>/dev/null || true
+    echo -e "${YELLOW}${notice}${NC}" >&2
+    return 0
+}
+
+cmd_upgrade() {
+    local check_only=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --check|-n) check_only=true; shift ;;
+            -h|--help)  cmd_upgrade_help; return 0 ;;
+            *)          echo -e "${RED}Error:${NC} unexpected argument: $1" >&2; return 1 ;;
+        esac
+    done
+
+    # A standalone copy of the script, dropped on PATH with no repository around
+    # it, upgrades by re-downloading itself. `git pull` has nothing to pull
+    # there, and refusing would leave the commonest install with no way forward.
+    if ! bb_root_is_git; then
+        cmd_upgrade_standalone "$check_only"
+        return $?
+    fi
+
+    echo ""
+    echo -e "${BLUE}bb-cli upgrade${NC}"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    echo -e "  Checkout: ${CYAN}${BB_CLI_ROOT}${NC}"
+    echo -e "  Version:  ${BB_CLI_VERSION}"
+    echo ""
+
+    # Refresh inline here: this command was asked for, so it may block.
+    if ! cmd_refresh_update_cache; then
+        echo -e "  ${YELLOW}Could not reach origin.${NC} That is not the same thing as up to date."
+        echo "  Check the network, or your credentials for this remote, and try again."
+        echo ""
+        return 1
+    fi
+
+    local behind branch
+    behind=$(sed -n '2p' "$UPDATE_CACHE" 2>/dev/null)
+    branch=$(sed -n '3p' "$UPDATE_CACHE" 2>/dev/null)
+    branch="${branch:-main}"
+    case "$behind" in
+        '' | *[!0-9]*) behind=0 ;;
+    esac
+
+    if [[ "$behind" == "0" ]]; then
+        echo -e "  ${GREEN}✓${NC} Already up to date with origin/${branch}."
+        echo ""
+        return 0
+    fi
+
+    echo -e "  ${YELLOW}${behind}${NC} commit(s) behind origin/${branch}."
+    echo ""
+
+    if [[ "$check_only" == true ]]; then
+        echo -e "  Run ${CYAN}bb-cli upgrade${NC} to apply."
+        echo ""
+        return 0
+    fi
+
+    if [[ -n "$(git -C "$BB_CLI_ROOT" status --porcelain 2>/dev/null)" ]]; then
+        echo -e "  ${RED}The checkout has local changes.${NC}" >&2
+        echo "  Commit or stash them first; upgrading would not be a fast-forward." >&2
+        echo "" >&2
+        return 1
+    fi
+
+    if ! bb_branch_is_safe "$branch"; then
+        echo -e "  ${RED}Refusing to pull an unusual branch name:${NC} ${branch}" >&2
+        echo "" >&2
+        return 1
+    fi
+
+    if ! git -C "$BB_CLI_ROOT" pull --ff-only --quiet origin "$branch"; then
+        echo -e "  ${RED}git pull failed.${NC} Resolve it in ${BB_CLI_ROOT}." >&2
+        echo "" >&2
+        return 1
+    fi
+
+    rm -f "$UPDATE_CACHE" "$UPDATE_NOTIFIED" 2>/dev/null || true
+
+    local new_version
+    new_version=$(grep -m1 '^BB_CLI_VERSION=' "${BB_CLI_ROOT}/bin/bb-cli" 2>/dev/null | cut -d'"' -f2)
+
+    echo -e "  ${GREEN}✓${NC} Updated to ${new_version:-unknown}."
+    echo ""
+    echo "  The executable, the man page and the skill are all symlinks into"
+    echo "  this checkout, so they followed automatically. Nothing to re-run."
+    echo ""
+}
+
+# Replace this script in place from the published copy. Used when bb-cli was
+# installed as a single file rather than as a checkout.
+cmd_upgrade_standalone() {
+    local check_only="$1"
+    local self raw tmp new_version
+
+    self="$BB_CLI_SELF"
+    raw="${BB_CLI_RAW_URL:-https://raw.githubusercontent.com/jonasporto/bb-cli/main/bin/bb-cli}"
+
+    echo ""
+    echo -e "${BLUE}bb-cli upgrade${NC}"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    echo -e "  Install:  ${CYAN}${self}${NC}  (single file, no checkout)"
+    echo -e "  Version:  ${BB_CLI_VERSION}"
+    echo ""
+
+    tmp="$(bb_tmp upgrade)"
+    if ! curl -fsSL "$raw" -o "$tmp" 2> /dev/null; then
+        echo -e "  ${RED}Could not reach ${raw}${NC}" >&2
+        echo "  Check the network, then try again." >&2
+        return 1
+    fi
+
+    # A truncated download that still parses would replace a working tool with a
+    # broken one, so check both that it is bash and that it is this program.
+    if ! bash -n "$tmp" 2> /dev/null || ! grep -q '^BB_CLI_VERSION=' "$tmp"; then
+        echo -e "  ${RED}The downloaded file is not a usable bb-cli.${NC} Nothing was changed." >&2
+        return 1
+    fi
+
+    new_version="$(grep -m1 '^BB_CLI_VERSION=' "$tmp" | cut -d'"' -f2)"
+
+    if [[ "$new_version" == "$BB_CLI_VERSION" ]]; then
+        echo -e "  ${GREEN}✓${NC} Already on ${BB_CLI_VERSION}."
+        echo ""
+        return 0
+    fi
+
+    if [[ "$check_only" == true ]]; then
+        echo -e "  ${YELLOW}!${NC} ${new_version} is available."
+        echo ""
+        echo -e "    ${CYAN}bb-cli upgrade${NC}"
+        echo ""
+        return 0
+    fi
+
+    if [[ ! -w "$self" ]]; then
+        echo -e "  ${RED}${self} is not writable.${NC}" >&2
+        echo "  Re-run with the rights to replace it, or install into a directory you own." >&2
+        return 1
+    fi
+
+    # cat over the existing inode rather than mv: the install may be a symlink,
+    # and replacing the link would leave the real file stale.
+    cat "$tmp" > "$self" || {
+        echo -e "  ${RED}Could not write ${self}.${NC}" >&2
+        return 1
+    }
+    chmod +x "$self" 2> /dev/null || true
+
+    echo -e "  ${GREEN}✓${NC} Updated ${BB_CLI_VERSION} -> ${new_version}."
+    echo ""
+    echo "  This install carries no docs, man page or skill. For those, and for"
+    echo "  upgrades over git:"
+    echo ""
+    echo -e "    ${CYAN}curl -fsSL https://raw.githubusercontent.com/jonasporto/bb-cli/main/install.sh | bash${NC}"
+    echo ""
+}
+
+cmd_upgrade_help() {
+    cat << 'EOF'
+Usage: bb-cli upgrade [--check]
+
+Update bb-cli by pulling the repository it was installed from.
+
+install.sh symlinks the executable, the man page and (with `bb-cli skill
+install`) the skill into that checkout, so a pull updates all four at once and
+there is nothing to re-run afterwards.
+
+Flags:
+  -n, --check   report whether an update exists, without applying it
+  -h, --help    this help
+
+Refuses to pull over local changes: the checkout is a git repository, and
+losing work there is not worth the convenience.
+
+A notice appears at most once a day when `bb-cli status` runs, and only for a
+human at a terminal - never in piped output, and never for an agent capturing
+it. Turn it off entirely with BB_CLI_NO_UPDATE_CHECK=1.
+
+Why git rather than a release feed: bb-cli installs as a git checkout, so git
+already knows what is new. It needs no tags and no releases API, it works the
+same whether the repository is public or private, and it reuses the credentials
+the clone already has.
+EOF
+}
+
+show_help() {
+    cat << EOF
+bb-cli ${BB_CLI_VERSION} - Bitbucket CLI
+
+Usage: bb-cli <command> [options]
+
+Core commands:
+  pr        List, show, edit, comment on and check pull requests
+  pipeline  List/show pipelines, steps, logs, failures; trigger, rerun,
+            watch, cancel  (aliased as 'run', gh's noun)
+  branch    List branches
+  repo      Repository info
+  cache     List and delete pipeline caches (gh cache)
+  signoff   Publish a build status from a local run (see: gh signoff)
+  api       Authenticated passthrough to the Bitbucket REST API
+
+Setup and help:
+  login     Configure credentials (interactive)
+  logout    Remove stored credentials
+  status    Show authentication status and what the token can do
+  docs      Read the bundled documentation (setup, scopes, api, pipelines, signoff)
+  man       Open the man page
+  skill     Install the Claude Code skill so agents know how to use bb-cli
+  upgrade   Pull the latest bb-cli (and with it the docs, man page and skill)
+  help      Show help for a command
+  version   Print the version
+
+Examples:
+  bb-cli login                           # Configure credentials
+  bb-cli status                          # Check auth status
+  bb-cli pr                              # List open PRs
+  bb-cli pr --branch feature/my-feature  # PRs from branch
+  bb-cli pr merged --limit 5             # Last 5 merged PRs
+  bb-cli pipeline                        # List recent pipelines
+  bb-cli pipeline 1234                  # Show pipeline details and steps
+  bb-cli pipeline cancel 1234           # Stop a running build (gh run cancel)
+  bb-cli pr checks 42                   # Build statuses on a PR (gh pr checks)
+  bb-cli pr edit 42 --body-file body.md # Edit title/description (gh pr edit)
+  bb-cli branch feature                  # Branches containing "feature"
+  bb-cli repo                            # Repository info
+  npm test && bb-cli signoff             # Sign off on a local run
+  bb-cli api repositories/:repo -i       # Anything else, plus response headers
+
+Every command takes --help. Start with 'bb-cli docs' if this is a new machine.
+EOF
+}
+
+# Main command dispatcher
+# jq parses every response and curl makes every call, so a command that reaches
+# the API without them dies inside a pipeline with "jq: command not found" and a
+# line number from a 3,900-line script. jq is the one dependency a fresh machine
+# usually lacks, so say what is missing and how to get it, before anything runs.
+bb_missing_deps() {
+    local dep missing=""
+    for dep in "$@"; do
+        command -v "$dep" > /dev/null 2>&1 || missing="${missing}${missing:+ }${dep}"
+    done
+    printf '%s' "$missing"
+}
+
+bb_install_hint() {
+    if command -v brew > /dev/null 2>&1; then
+        echo "brew install $*"
+    elif command -v apt-get > /dev/null 2>&1; then
+        echo "sudo apt-get install $*"
+    elif command -v dnf > /dev/null 2>&1; then
+        echo "sudo dnf install $*"
+    elif command -v pacman > /dev/null 2>&1; then
+        echo "sudo pacman -S $*"
+    else
+        echo "install $* with your package manager"
+    fi
+}
+
+bb_require_deps() {
+    local missing
+    missing="$(bb_missing_deps curl jq)"
+    [[ -z "$missing" ]] && return 0
+
+    echo -e "${RED}Error:${NC} bb-cli needs ${missing} for this command." >&2
+    echo "" >&2
+    echo -e "    ${CYAN}$(bb_install_hint $missing)${NC}" >&2
+    echo "" >&2
+    echo "  Commands that touch the API need both. 'bb-cli version', '--help'," >&2
+    echo "  'docs' and 'man' work without them." >&2
+    return 1
+}
+
+main() {
+    local command="${1:-help}"
+    shift || true
+
+    # Everything that talks to Bitbucket needs curl and jq. The rest is the
+    # documentation surface, which must keep working on a machine that has
+    # neither: it is where you go to find out what to install.
+    case "$command" in
+        version|--version|-v|help|--help|-h|docs|doc|man|skill|logout|status) ;;
+        *) bb_require_deps || return 1 ;;
+    esac
+
+    case "$command" in
+        login)
+            cmd_login "$@"
+            ;;
+        logout)
+            cmd_logout "$@"
+            ;;
+        status|whoami)
+            cmd_status "$@"
+            ;;
+        auth)
+            # gh keeps these under `auth`; bb-cli has always had them at the
+            # top level. Accept both rather than picking a side.
+            case "${1:-status}" in
+                login) shift; cmd_login "$@" ;;
+                logout) shift; cmd_logout "$@" ;;
+                status | "") shift || true; cmd_status "$@" ;;
+                -h | --help) echo "Usage: bb-cli auth <login|logout|status>" ;;
+                *) echo -e "${RED}Unknown auth command:${NC} $1" >&2; exit 1 ;;
+            esac
+            ;;
+        pr|prs|pull-request|pull-requests)
+            cmd_pr "$@"
+            ;;
+        pipeline|pipelines|pipe|pipes|run|runs)
+            # `run` because that is gh's noun for the same object. Bitbucket
+            # calls them pipelines, so that stays the primary name, but muscle
+            # memory from `gh run list` should not hit "Unknown command".
+            cmd_pipeline "$@"
+            ;;
+        workflow|workflows)
+            # `gh workflow run` starts one; here that is `pipeline trigger`.
+            # Bitbucket has no separate workflow object, so this only forwards.
+            cmd_pipeline "$@"
+            ;;
+        cache|caches)
+            cmd_cache "$@"
+            ;;
+        branch|branches)
+            cmd_branch "$@"
+            ;;
+        repo|repository)
+            cmd_repo "$@"
+            ;;
+        signoff)
+            cmd_signoff "$@"
+            ;;
+        api)
+            cmd_api "$@"
+            ;;
+        docs|doc)
+            cmd_docs "$@"
+            ;;
+        man|manual)
+            cmd_man "$@"
+            ;;
+        skill|skills)
+            cmd_skill "$@"
+            ;;
+        version|--version|-v)
+            echo "bb-cli ${BB_CLI_VERSION}"
+            ;;
+        upgrade|update|self-update)
+            cmd_upgrade "$@"
+            ;;
+        _refresh-update-cache)
+            cmd_refresh_update_cache
+            ;;
+        help|--help|-h)
+            if [[ -n "${1:-}" ]]; then
+                case "$1" in
+                    pr) cmd_pr_help ;;
+                    pipeline|pipelines|pipe|pipes) cmd_pipeline_help ;;
+                    branch) cmd_branch_help ;;
+                    repo) cmd_repo_help ;;
+                    signoff) cmd_signoff_help ;;
+                    api) cmd_api_help ;;
+                    cache|caches) cmd_cache_help ;;
+                    skill|skills) cmd_skill_help ;;
+                    docs|doc) cmd_docs ;;
+                    upgrade|update) cmd_upgrade_help ;;
+                    login) cmd_login_help ;;
+                    logout) echo "Usage: bb-cli logout - Remove stored credentials" ;;
+                    status) echo "Usage: bb-cli status - Show current authentication status" ;;
+                    *) show_help ;;
+                esac
+            else
+                show_help
+            fi
+            ;;
+        *)
+            echo -e "${RED}Unknown command:${NC} $command" >&2
+            echo "Run 'bb-cli help' for usage." >&2
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

@@ -1,0 +1,323 @@
+.TH BB\-CLI 1 "September 2026" "bb-cli 0.2.0" "User Commands"
+.SH NAME
+bb\-cli \- Bitbucket from the command line
+.SH SYNOPSIS
+.B bb\-cli
+.I command
+.RI [ options ]
+.SH DESCRIPTION
+.B bb\-cli
+is to Bitbucket Cloud what
+.BR gh (1)
+is to GitHub: pull requests, pipelines, branches and build statuses from a
+terminal, without opening a browser and without hand\-rolling
+.BR curl (1)
+calls.
+.PP
+It is a single bash script. It needs
+.BR curl ,
+.BR jq
+and
+.BR git ,
+and authenticates over HTTP Basic with an Atlassian API token.
+.PP
+Anything the named commands do not cover is reachable through
+.BR "bb\-cli api" ,
+an authenticated passthrough to the REST API. Reaching for
+.BR curl
+directly should be treated as a missing feature.
+.SH COMMANDS
+.SS Reading
+.TP
+.B pr \fR[\fInumber\fR] [\fIoptions\fR]
+List pull requests, or show one in detail including its description. Filters:
+.BR \-\-branch ,
+.BR \-\-target ,
+.BR \-\-author ,
+.BR \-\-state ,
+.BR \-\-limit .
+.B \-j
+returns raw JSON,
+.B \-c
+includes comments. Subcommands mirror
+.BR gh (1):
+.BR "view <n>" ,
+.BR "checks <n>" ,
+.BR "edit <n>" ,
+.BR "ready <n>" ,
+.BR "comment <n>" .
+.TP
+.B pr edit \fIn\fR [\fB\-\-title\fI t\fR] [\fB\-\-body\-file\fI f\fR]
+Change a pull request's title, description, or both. The current values are read
+first and both fields are sent, so changing one cannot blank the other. Use
+.B \-\-body\-file
+rather than an inline string: markdown hard breaks are trailing spaces, and
+command substitution strips them.
+.TP
+.B pr checks \fIn\fR
+The build statuses on the pull request's head commit \- including any published
+by
+.BR "bb\-cli signoff" .
+.TP
+.B pipeline \fR[\fInumber\fR] [\fIsubcommand\fR]
+List pipelines, or show one with its steps. Subcommands:
+.BR steps ,
+.BR "step <uuid> \-\-log" ,
+.BR failures ,
+.BR "trigger \-\-branch <b> [\-\-custom <name>]" ,
+.BR "rerun <n>" ,
+.BR "cancel <n>" ,
+.BR "watch <n> [\-\-exit\-status]" .
+Flags may appear before or after the subcommand.
+.BR run
+is accepted as a synonym, since that is
+.BR gh 's
+noun for the same object.
+.TP
+.B branch \fR[\fIfilter\fR]
+List branches, most recently updated first.
+.TP
+.B cache \fR[\fBlist\fR|\fBdelete\fI uuid\fR]
+Pipeline caches, the counterpart of
+.BR "gh cache" .
+Deletion is by uuid only: Bitbucket also accepts a name, and that removes every
+cache sharing it, on every branch.
+.TP
+.B repo
+Repository metadata: description, default branch, size, language.
+.SS Writing
+.TP
+.B signoff \fR[\fIoptions\fR]
+Publish a build status on a commit from the result of a local run, the
+counterpart of
+.BR "gh signoff" .
+Defaults to
+.B SUCCESSFUL
+on
+.BR HEAD ,
+with key
+.BR local\-signoff .
+Refuses on a dirty working tree or an unpushed commit unless
+.B \-\-force
+is given. Needs only
+.BR read:repository:bitbucket .
+.TP
+.B signoff status \fR[\fB\-\-commit\fI rev\fR]
+List every build status on a commit, including ones published by pipelines and
+third\-party integrations.
+.SS Escape hatch
+.TP
+.B api \fIendpoint\fR [\fIoptions\fR]
+Authenticated passthrough to the Bitbucket REST API. Paths are resolved under
+.I https://api.bitbucket.org/2.0/
+unless they already begin with
+.I 2.0/
+or
+.IR internal/ .
+The placeholders
+.BR :repo ,
+.B :workspace
+and
+.B :slug
+expand from the git remote.
+.RS
+.TP
+.BI \-X " method"
+HTTP method. Default GET, or POST when \fB\-\-input\fR is given. Unlike
+.BR "gh api" ,
+fields alone do not imply POST: on Bitbucket a POST to
+.I /pullrequests
+creates a pull request.
+.TP
+.BI \-f " key=value"
+String field. A query parameter on GET, a JSON field on a write.
+.TP
+.BI \-F " key=value"
+Typed field: booleans, null and numbers stay unquoted;
+.BI @ file
+reads the value from a file.
+.TP
+.BI \-\-input " file"
+Request body, verbatim.
+.B \-
+reads stdin. Use this for anything multi\-line: it preserves trailing
+whitespace, which shell quoting does not.
+.TP
+.BI \-q " expression"
+Filter the response through jq.
+.TP
+.B \-i
+Print response headers.
+.B x\-oauth\-scopes
+there is the definitive answer to what a token can do.
+.TP
+.B \-\-paginate
+Follow
+.I next
+links and merge every page's
+.I .values
+into one array.
+.RE
+.SS Setup and discovery
+.TP
+.B login \fR[\fB--with-token\fR] [\fB--email\fI email\fR]
+Store an Atlassian API token. Interactive by default: it prints which scopes to
+check, then prompts. With
+.B --with-token
+it reads the token from standard input and prompts for nothing, which is the
+form a script, a CI job or an agent can complete; the account email then comes
+from
+.BR --email ,
+else
+.BR $BITBUCKET_USERNAME ,
+else
+.BR "git config user.email" .
+The credential is verified against the API before anything is written. A bare
+.B login
+with no terminal exits 1 rather than consuming an invisible prompt.
+.TP
+.B logout
+Remove stored credentials.
+.TP
+.B status
+Show authentication status and the resolved repository.
+.TP
+.B docs \fR[\fItopic\fR]
+Print the bundled documentation. Topics:
+.BR setup ,
+.BR scopes ,
+.BR api ,
+.BR pipelines ,
+.BR signoff .
+.TP
+.B man
+Open this page.
+.TP
+.B skill install \fR[\fB\-\-dir\fI dir\fR] [\fB\-\-project\fR]
+Install the bundled Claude Code skill, so an AI agent on a machine that has
+never seen bb\-cli knows what it is and how to drive it.
+.TP
+.B version
+Print the version.
+.SH GLOBAL OPTIONS
+.TP
+.BI \-R ", " \-\-repo " workspace/slug"
+Act on a repository other than the one the current directory belongs to.
+Accepts
+.I workspace/slug
+or a full Bitbucket URL. Required when running outside a checkout.
+.TP
+.BR \-h ", " \-\-help
+Every command accepts this.
+.SH FILES
+.TP
+.I ~/.config/bb\-cli/credentials
+Shell file, sourced at startup. Mode 600 in a 700 directory.
+.RS
+.PP
+.nf
+BITBUCKET_USERNAME=<atlassian email>
+BITBUCKET_API_TOKEN=<token>
+.fi
+.RE
+.SH ENVIRONMENT
+.TP
+.B BITBUCKET_USERNAME
+.TQ
+.B BITBUCKET_API_TOKEN
+Take precedence over the credentials file, which is then never read. Useful in
+CI and for trying a token without editing the file.
+.TP
+.B BITBUCKET_APP_PASSWORD
+Accepted as a legacy alias for
+.BR BITBUCKET_API_TOKEN .
+.SH TOKEN SCOPES
+Create the token at
+.I id.atlassian.com
+under Security, API tokens, "Create API token with scopes", choosing the
+Bitbucket app. Check exactly five:
+.PP
+.nf
+read:repository:bitbucket     write:pipeline:bitbucket
+read:pullrequest:bitbucket    write:pullrequest:bitbucket
+read:pipeline:bitbucket
+.fi
+.PP
+Two traps:
+.B write
+does not imply
+.BR read ,
+so both halves of each pair must be checked; and scopes are fixed at creation,
+so a token cannot gain one later.
+.PP
+.B admin:repository:bitbucket
+is deliberately not in that list. It is what branch restrictions require, to
+read as well as to write, and that policy is not a developer credential's to
+edit.
+.PP
+Run
+.B bb\-cli docs scopes
+for what each command needs, which scopes look necessary and are not, and how
+to prove what a token holds from the response headers.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+An error, including any HTTP status of 400 or above. The response body is still
+printed, because Bitbucket's error bodies name the missing scope or field.
+.SH EXAMPLES
+.PP
+Sign off on a local test run:
+.PP
+.nf
+.RS
+npm test && bb\-cli signoff \-\-name "vitest 461 passed, 8s"
+.RE
+.fi
+.PP
+Read a pull request's description without leaving the terminal:
+.PP
+.nf
+.RS
+bb\-cli api repositories/:repo/pullrequests/10 \-q .description
+.RE
+.fi
+.PP
+Rewrite a pull request body from a file, byte for byte:
+.PP
+.nf
+.RS
+bb\-cli api repositories/:repo/pullrequests/10 \-X PUT \-\-input body.json
+.RE
+.fi
+.PP
+Find out what the current token is actually allowed to do:
+.PP
+.nf
+.RS
+bb\-cli api repositories/:repo \-i | grep \-i oauth
+.RE
+.fi
+.PP
+Trigger a custom pipeline on a branch and wait for it:
+.PP
+.nf
+.RS
+bb\-cli pipeline trigger \-\-branch my\-branch \-\-custom "Unit specs"
+bb\-cli pipeline watch 1241 \-\-exit\-status
+.RE
+.fi
+.SH SEE ALSO
+.BR gh (1),
+.BR jq (1),
+.BR git (1)
+.PP
+.B bb\-cli docs
+for the full documentation set, which ships in the repository.
+.SH BUGS
+Bitbucket's public REST API has no endpoint for rerunning only the failed steps
+of a pipeline, although the web UI offers it.
+.B bb\-cli pipeline rerun \-\-failed
+says so rather than quietly doing something else.

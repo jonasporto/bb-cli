@@ -1,0 +1,132 @@
+name: Require Issue for PR
+
+on:
+  pull_request_target:
+    types: [opened, edited]
+
+permissions:
+  pull-requests: write
+  issues: write
+
+jobs:
+  check-issue:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/github-script@v8
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const author = pr.user.login;
+
+            // Bots first: an automated account never has an issue to reference,
+            // so the check below would close it with the wrong explanation, and
+            // a merged bot PR would put the bot in the contributor list for
+            // good. Nothing here has a dependency manifest, so there is no
+            // legitimate bot PR to allow through.
+            if (pr.user.type === 'Bot' || /\[bot\]$/.test(author)) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number,
+                body: `This repository does not accept pull requests from automated accounts.
+
+            bb-cli is one bash script with no dependency manifest, so there is nothing
+            for a dependency bot to update. Workflow action versions are pinned and
+            bumped by hand.
+
+            If a human sent this, open an Issue from your own account.`
+              });
+              await github.rest.pulls.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: pr.number,
+                state: 'closed'
+              });
+              core.setFailed(`Automated account: ${author}`);
+              return;
+            }
+
+            // Maintainers and collaborators are exempt.
+            const { data: permissionLevel } = await github.rest.repos.getCollaboratorPermissionLevel({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              username: author
+            });
+
+            if (['admin', 'write'].includes(permissionLevel.permission)) {
+              console.log(`Skipping check for ${author} (${permissionLevel.permission} access)`);
+              return;
+            }
+
+            const body = pr.body || '';
+            const issuePattern = /(close[sd]?|fix(e[sd])?|resolve[sd]?)\s*#(\d+)|#(\d+)/gi;
+            const matches = body.match(issuePattern);
+
+            if (!matches) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number,
+                body: `Thanks for your interest in contributing!
+
+            This project requires PRs to be linked to an existing Issue.
+
+            **Please:**
+            1. Open an Issue describing the proposed change
+            2. Wait for feedback/approval from maintainers
+            3. Then open a PR referencing the issue (e.g., \`Fixes #123\`)
+
+            This helps us avoid duplicate work and align expectations before code is written.
+
+            Closing this PR automatically.`
+              });
+
+              await github.rest.pulls.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: pr.number,
+                state: 'closed'
+              });
+
+              core.setFailed('PR must reference an issue');
+              return;
+            }
+
+            const issueNumbers = [...new Set(matches.map(m => m.match(/\d+/)[0]))];
+
+            for (const num of issueNumbers) {
+              try {
+                const issue = await github.rest.issues.get({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: parseInt(num)
+                });
+
+                // An issue, not another PR.
+                if (!issue.data.pull_request) {
+                  console.log(`Valid issue #${num} found`);
+                  return;
+                }
+              } catch (e) {
+                // Issue doesn't exist
+              }
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr.number,
+              body: `The referenced issue was not found or is not valid.
+
+            Please open an Issue first, then reference it in your PR.`
+            });
+
+            await github.rest.pulls.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pr.number,
+              state: 'closed'
+            });
+
+            core.setFailed('Referenced issue not found');

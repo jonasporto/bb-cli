@@ -1,0 +1,183 @@
+name: Tests
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+# A newer push supersedes the runs of the older one: cancel them instead of
+# queueing, so iterating quickly never waits on stale results.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege: nothing here writes to the repository. Without this block a
+# workflow inherits whatever the repository default is, which for older repos is
+# read/write on everything.
+permissions:
+  contents: read
+
+jobs:
+  # External PRs run only when they reference an issue, matching the gate in
+  # require-issue.yml. Collaborators and pushes always run.
+  should-run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.check.outputs.run }}
+    steps:
+      - id: check
+        uses: actions/github-script@v8
+        with:
+          script: |
+            if (context.eventName === 'push') {
+              core.setOutput('run', 'true');
+              return;
+            }
+
+            const pr = context.payload.pull_request;
+            const author = pr.user.login;
+
+            try {
+              const { data: perm } = await github.rest.repos.getCollaboratorPermissionLevel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                username: author
+              });
+              if (['admin', 'write'].includes(perm.permission)) {
+                core.setOutput('run', 'true');
+                console.log(`Author ${author} has ${perm.permission} access`);
+                return;
+              }
+            } catch (e) {
+              // Not a collaborator
+            }
+
+            const body = pr.body || '';
+            const issuePattern = /(close[sd]?|fix(e[sd])?|resolve[sd]?)\s*#(\d+)|#(\d+)/gi;
+            if (body.match(issuePattern)) {
+              core.setOutput('run', 'true');
+              console.log('PR has issue reference');
+              return;
+            }
+
+            console.log('Skipping tests - external PR without issue reference');
+            core.setOutput('run', 'false');
+
+  test:
+    needs: should-run
+    if: needs.should-run.outputs.run == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      # `bin/bb-cli` hard-codes `#!/bin/bash`, so on macOS it always runs under
+      # the system 3.2.57, which is the version docs/setup.md promises. The
+      # bash5 entry is what most Linux users get. Running both side by side
+      # keeps the promise honest in the only two shapes that ship.
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux
+          - os: macos-latest
+            name: macos-bash5
+          - os: macos-latest
+            name: macos-bash32
+    name: test (${{ matrix.name }})
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install dependencies
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get update
+            sudo apt-get install -y jq
+          else
+            command -v jq > /dev/null 2>&1 || brew install jq
+          fi
+
+      # The suite is offline by design: a fake `curl` on PATH answers from a
+      # fixture, so there is no token and no network call in CI.
+      - name: Run tests
+        if: matrix.name != 'macos-bash32'
+        run: tests/run.sh
+
+      - name: Run tests under macOS system bash 3.2
+        if: matrix.name == 'macos-bash32'
+        run: /bin/bash tests/run.sh
+
+  # A machine with no jq must say so instead of printing an empty result: jq
+  # parses every response, so its absence is the one dependency failure a new
+  # user will actually hit.
+  test-minimal:
+    needs: should-run
+    if: needs.should-run.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    container: debian:12-slim
+    steps:
+      - name: Install the bare minimum
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends bash git ca-certificates
+          git config --global --add safe.directory '*'
+
+      - uses: actions/checkout@v5
+
+      - name: The tool still starts and documents itself without jq
+        run: |
+          chmod +x bin/bb-cli
+          ./bin/bb-cli version
+          ./bin/bb-cli --help > /dev/null
+          ./bin/bb-cli docs > /dev/null
+          ./bin/bb-cli docs setup > /dev/null
+
+          # status is the diagnostic: it must run without the dependencies in
+          # order to name them, and exit non-zero because it could not check.
+          if ./bin/bb-cli status > status.out 2>&1; then
+            echo "status should exit non-zero when jq is missing" >&2
+            cat status.out >&2
+            exit 1
+          fi
+          grep -q "Missing:" status.out
+          grep -qE "Missing:.*jq" status.out
+          ! grep -q "Not authenticated" status.out
+
+          # An API command must say what is missing, not die inside a pipeline.
+          if ./bin/bb-cli pr > pr.out 2>&1; then
+            echo "pr should exit non-zero when jq is missing" >&2
+            exit 1
+          fi
+          # The container has neither curl nor jq, so the message names both:
+          # "needs curl jq". Matching the literal "needs jq" failed the job on
+          # the very first public push while the tool was behaving correctly.
+          grep -qE "needs .*jq" pr.out
+          ! grep -q "command not found" pr.out
+
+      - name: install.sh reports the missing dependency and exits non-zero
+        run: |
+          if ./install.sh --bin-dir /tmp/binx; then
+            echo "install.sh should have failed without jq" >&2
+            exit 1
+          fi
+
+  shellcheck:
+    needs: should-run
+    if: needs.should-run.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      # Errors are blocking (baseline 2026-09-04: zero across both scripts).
+      - name: Run ShellCheck (errors block)
+        run: shellcheck -S error bin/bb-cli install.sh
+
+      # Warnings are informational (baseline 2026-09-04: 4).
+      - name: Run ShellCheck (warnings, informational)
+        run: shellcheck -S warning bin/bb-cli install.sh || true

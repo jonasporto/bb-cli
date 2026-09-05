@@ -1,0 +1,11 @@
+# `bb-cli skill install --project` writes ./.claude/skills/bb-cli. Run inside
+# this checkout that is a symlink pointing back at the repository itself, which
+# must never be committed.
+.claude/
+
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*~
+*.bak
