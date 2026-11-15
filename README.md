@@ -12,6 +12,9 @@ One bash script. No build step, no runtime, no daemon.
 
 ```bash
 bb-cli pr                                    # open pull requests
+bb-cli pr create --title "Change" --base main --body-file body.md --draft
+bb-cli pr diffstat 42                         # files and line counts
+bb-cli pipeline list --custom "Unit specs"    # exact custom selector
 bb-cli pipeline 1234 failures               # why did the build fail
 npm test && bb-cli signoff                   # local CI: publish a green check
 bb-cli api repositories/:repo -i             # anything else

@@ -638,7 +638,7 @@ print_pipeline_rows() {
             else "\($s)s"
             end;
         def short_commit: (.target.commit.hash // "N/A") | if length > 12 then .[0:12] else . end;
-        def pipeline_type: (.target.selector.type // .target.type // "N/A");
+        def pipeline_type: (.target.selector.type // .target.type // "N/A") + (if .target.selector.pattern then " / " + .target.selector.pattern else "" end);
         def trigger_type: (.trigger.type // .trigger.name // "N/A");
         .values[] |
         "  \u001b[1;33m#\(.build_number)\u001b[0m \(status) • \(duration)",
@@ -989,7 +989,7 @@ cmd_pipeline() {
 
     case "$action" in
         list)
-            cmd_pipeline_list "$limit" "$branch" "$status" "$author" "$json_output"
+            cmd_pipeline_list "$limit" "$branch" "$status" "$author" "$json_output" "$custom"
             ;;
         show)
             cmd_pipeline_show "$pipeline_ref" "$json_output"
@@ -1024,10 +1024,11 @@ cmd_pipeline_list() {
     local status="$3"
     local author="$4"
     local json_output="$5"
+    local custom="${6:-}"
     local fetch_limit="$limit"
     local params
 
-    if [[ -n "$branch" || -n "$status" || -n "$author" ]]; then
+    if [[ -n "$branch" || -n "$status" || -n "$author" || -n "$custom" ]]; then
         fetch_limit=100
     fi
 
@@ -1045,6 +1046,7 @@ cmd_pipeline_list() {
         --arg branch "$branch" \
         --arg status_filter "$status" \
         --arg author "$author" \
+        --arg custom "$custom" \
         --argjson limit "$limit" '
         def normalized_status:
           (.state.result.name // .state.name // .state.stage.name // "UNKNOWN")
@@ -1070,6 +1072,7 @@ cmd_pipeline_list() {
         .values |= [
           .[] |
           select(branch_matches($branch)) |
+          select(($custom == "") or (.target.selector.type == "custom" and .target.selector.pattern == $custom)) |
           select(($status_filter == "") or (normalized_status | contains($status_filter | ascii_downcase))) |
           select(($author == "") or (author_text | contains($author | ascii_downcase)))
         ][: $limit]
@@ -1537,7 +1540,7 @@ Options:
   -s, --status      Filter list by pipeline status
   -a, --author      Filter list by creator/display name
   -l, --limit       Max pipelines in list (default: 20)
-  -c, --custom      Custom pipeline name for trigger (e.g. "Unit specs")
+  -c, --custom      Custom pipeline name for trigger or list filter (e.g. "Unit specs")
   --log             Show raw log for a step
   --exit-status     watch: exit non-zero when the pipeline fails (gh-style)
   -j, --json        Output raw JSON
@@ -1582,6 +1585,11 @@ cmd_pr() {
     # Parse arguments
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            create)
+                shift
+                cmd_pr_create "$@"
+                return $?
+                ;;
             view)
                 shift
                 if [[ $# -gt 0 && "$1" =~ ^[0-9]+$ ]]; then
@@ -1590,7 +1598,7 @@ cmd_pr() {
                     shift
                 fi
                 ;;
-            edit | ready | comment)
+            edit | ready | comment | diffstat)
                 # gh pr edit|ready|comment. These own the rest of the line.
                 local verb="$1"
                 shift
@@ -1603,6 +1611,7 @@ cmd_pr() {
                 get_repo_info
                 check_credentials
                 case "$verb" in
+                    diffstat) cmd_pr_diffstat "$pr_id" "$@" ;;
                     edit) cmd_pr_edit "$pr_id" "$@" ;;
                     ready) cmd_pr_ready "$pr_id" "$@" ;;
                     comment) cmd_pr_comment "$pr_id" "$@" ;;
@@ -1664,6 +1673,9 @@ cmd_pr() {
                 elif [[ "$1" != -* ]]; then
                     # String with non-numeric chars = branch filter
                     branch="$1"
+                else
+                    echo "Unknown option: $1. For other API operations, run 'bb-cli api --help'." >&2
+                    return 1
                 fi
                 shift
                 ;;
@@ -1740,7 +1752,7 @@ cmd_pr() {
 
     echo "$response" | jq -r '
         .values[] |
-        "  \u001b[1;33m#\(.id)\u001b[0m \(.title)",
+        "  \u001b[1;33m#\(.id)\u001b[0m \(.title)\(if .draft then " [DRAFT]" else "" end)",
         "     \u001b[0;36m\(.source.branch.name)\u001b[0m → \(.destination.branch.name)",
         "     by \(.author.display_name) • \(.updated_on | split("T")[0])",
         "     \(.links.html.href)",
@@ -1809,6 +1821,11 @@ cmd_pr_show() {
     updated_on=$(echo "$pr_response" | jq -r '.updated_on | split("T")[0]')
     url=$(echo "$pr_response" | jq -r '.links.html.href')
 
+    local draft_label=""
+    if [[ "$(echo "$pr_response" | jq -r '.draft // false')" == true ]]; then
+        draft_label=" (DRAFT)"
+    fi
+
     # Comments and activity are independent of each other, so they go out
     # together rather than one after the other. On a normal connection that is
     # the difference between roughly 600ms and roughly 300ms of waiting.
@@ -1845,7 +1862,7 @@ cmd_pr_show() {
     [[ "$state" == "MERGED" ]] && state_color="${CYAN}"
     [[ "$state" == "DECLINED" ]] && state_color="${RED}"
 
-    echo -e "  State:   ${state_color}${state}${NC}"
+    echo -e "  State:   ${state_color}${state}${draft_label}${NC}"
     echo -e "  Author:  ${author}"
     echo -e "  Branch:  ${CYAN}${source_branch}${NC} → ${dest_branch}"
     echo -e "  Created: ${created_on}"
@@ -2003,6 +2020,81 @@ bb_read_body() {
         BB_BODY_TEXT="$literal"
     fi
     return 0
+}
+
+cmd_pr_create() {
+    local title="" body="" body_file="" base="" head="" draft=false json_output=false dry_run=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --title|--body|--body-file|--base|--head)
+                [[ $# -ge 2 ]] || { echo "Missing value for $1" >&2; return 1; }
+                case "$1" in
+                    --title) title="$2" ;; --body) body="$2" ;; --body-file) body_file="$2" ;;
+                    --base) base="$2" ;; --head) head="$2" ;;
+                esac
+                shift 2 ;;
+            --title=*) title="${1#*=}"; shift ;;
+            --body=*) body="${1#*=}"; shift ;;
+            --body-file=*) body_file="${1#*=}"; shift ;;
+            --base=*) base="${1#*=}"; shift ;;
+            --head=*) head="${1#*=}"; shift ;;
+            --draft) draft=true; shift ;;
+            --json|-j) json_output=true; shift ;;
+            --dry-run) dry_run=true; shift ;;
+            --help|-h) cmd_pr_help; return 0 ;;
+            *) echo "Unexpected argument: $1. For other API operations, run 'bb-cli api --help'." >&2; return 1 ;;
+        esac
+    done
+    [[ -n "$title" && -n "$base" ]] || { echo 'pr create requires --title and --base' >&2; return 1; }
+    if [[ -z "$head" ]]; then
+        head="$(git symbolic-ref --quiet --short HEAD 2>/dev/null)" || {
+            echo 'Detached or missing checkout: pass --head explicitly' >&2; return 1;
+        }
+    fi
+    bb_read_body "$body" "$body_file" || return 1
+    get_repo_info
+    local payload
+    payload="$(jq -nc --arg title "$title" --arg body "$BB_BODY_TEXT" --arg base "$base" --arg head "$head" --argjson draft "$draft" \
+        '{title:$title,description:$body,source:{branch:{name:$head}},destination:{branch:{name:$base}},draft:$draft}')"
+    if [[ "$dry_run" == true ]]; then
+        echo "POST https://api.bitbucket.org/2.0/repositories/${WORKSPACE}/${REPO}/pullrequests"
+        printf '%s' "$payload" | jq .
+        return 0
+    fi
+    check_credentials
+    local rc=0
+    api_request POST "https://api.bitbucket.org/2.0/repositories/${WORKSPACE}/${REPO}/pullrequests" \
+        -H 'Content-Type: application/json' --data-binary "$payload" || rc=$?
+    if [[ $rc -ne 0 ]] || api_status_is_error; then
+        api_report_error 'creating pull request'
+        api_cleanup
+        return 1
+    fi
+    if [[ "$json_output" == true ]]; then
+        cat "$API_BODY_FILE" | jq .
+    else
+        jq -r '.links.html.href // ("Created PR #" + (.id|tostring))' "$API_BODY_FILE"
+    fi
+    api_cleanup
+}
+
+cmd_pr_diffstat() {
+    local pr_id="$1" json_output=false response
+    shift
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json|-j) json_output=true; shift ;;
+            --help|-h) cmd_pr_help; return 0 ;;
+            *) echo "Unexpected argument: $1. For other API operations, run 'bb-cli api --help'." >&2; return 1 ;;
+        esac
+    done
+    # Reuse the authenticated redirect and safe pagination path.
+    response="$(cmd_api "repositories/${WORKSPACE}/${REPO}/pullrequests/${pr_id}/diffstat" --paginate)" || return 1
+    if [[ "$json_output" == true ]]; then
+        printf '%s\n' "$response"
+    else
+        printf '%s\n' "$response" | jq -r '.values[] | "\(.status)\t+\(.lines_added // 0)\t-\(.lines_removed // 0)\t\(.new.path // .old.path)"'
+    fi
 }
 
 cmd_pr_edit() {
@@ -2225,6 +2317,9 @@ Usage: bb-cli pr [<number>] [options]
 Commands (mirroring gh):
   pr [list]                     List pull requests
   pr view <n> / pr <n>          Show one, with its description
+  pr create --title T --base BRANCH [--head BRANCH] [--body-file F] [--draft]
+                                --head defaults to the current branch; --dry-run writes nothing
+  pr diffstat <n> [--json]      File changes, across all returned pages
   pr checks <n>                 Build statuses on its head commit
   pr edit <n> [--title T] [--body-file F]
   pr ready <n> [--undo]         Draft -> ready for review, or back
@@ -3903,7 +3998,7 @@ bb-cli ${BB_CLI_VERSION} - Bitbucket CLI
 Usage: bb-cli <command> [options]
 
 Core commands:
-  pr        List, show, edit, comment on and check pull requests
+  pr        Create, list, show, edit, diffstat, comment on and check pull requests
   pipeline  List/show pipelines, steps, logs, failures; trigger, rerun,
             watch, cancel  (aliased as 'run', gh's noun)
   branch    List branches
@@ -4088,7 +4183,7 @@ main() {
             ;;
         *)
             echo -e "${RED}Unknown command:${NC} $command" >&2
-            echo "Run 'bb-cli help' for usage." >&2
+            echo "Run 'bb-cli help' for usage; 'bb-cli api --help' covers other API operations." >&2
             exit 1
             ;;
     esac
