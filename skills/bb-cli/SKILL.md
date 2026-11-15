@@ -8,6 +8,16 @@ description: "Use bb-cli for anything on Bitbucket Cloud: pull requests, pipelin
 `bb-cli` is to Bitbucket Cloud what `gh` is to GitHub. If a repository's remote
 is `bitbucket.org`, this is the tool. `gh` will not work on it.
 
+## Pull requests and pipeline selection
+
+Use `bb-cli pr create --title T --base BRANCH --body-file FILE [--head BRANCH] [--draft]`.
+The head defaults to the current branch; detached checkouts require `--head`.
+`--body-file -` reads stdin, and `--dry-run` prints the request without sending it.
+Use `pr diffstat NUMBER [--json]` for file changes across pages, and `pr edit NUMBER`
+for title/description updates. Draft state appears in list and detail output.
+`pipeline list --custom NAME` filters by the exact custom selector name; list rows
+also display the selector so different pipelines are not compared accidentally.
+
 ## Before anything else
 
 ```bash

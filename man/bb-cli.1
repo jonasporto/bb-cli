@@ -47,6 +47,18 @@ includes comments. Subcommands mirror
 .BR "ready <n>" ,
 .BR "comment <n>" .
 .TP
+.B pr create --title T --base BRANCH [--head BRANCH] [--body-file FILE] [--draft]
+Create a pull request. The head defaults to the current branch; detached checkouts
+require an explicit head. A body-file of - reads stdin. --dry-run prints the
+request without sending it; --json returns the response as JSON.
+.TP
+.B pr diffstat NUMBER [--json]
+Read file changes and line counts across returned pages. Removed files use their
+old path. Draft state is displayed by both pr list and pr view.
+.TP
+.B pipeline list --custom NAME
+Filter by exact custom selector name. The list also displays selector names.
+.TP
 .B pr edit \fIn\fR [\fB\-\-title\fI t\fR] [\fB\-\-body\-file\fI f\fR]
 Change a pull request's title, description, or both. The current values are read
 first and both fields are sent, so changing one cannot blank the other. Use

@@ -6,6 +6,15 @@ follow [semver][semver], with the caveat that everything below 1.0 may break.
 [kac]: https://keepachangelog.com/en/1.1.0/
 [semver]: https://semver.org/spec/v2.0.0.html
 
+## [Unreleased]
+
+### Added
+
+- `pr create` with explicit title/base, optional head, draft, body-file/stdin,
+  JSON output and dry-run; `pr diffstat` reuses safe API pagination.
+- Draft labels in PR lists and details; exact `pipeline list --custom` filtering
+  and visible selector names; an API hint on unknown commands.
+
 ## [0.2.0] - 2026-09-05
 
 Everything a repository needs before strangers can read it, plus the onboarding
